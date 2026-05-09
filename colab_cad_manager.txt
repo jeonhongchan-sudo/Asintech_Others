@@ -1,0 +1,874 @@
+import os
+from google.colab import drive
+
+# 1. 구글 드라이브 마운트 (캐시 저장을 위해 필수)
+if not os.path.exists('/content/drive'):
+    print("📁 구글 드라이브를 마운트합니다...")
+    drive.mount('/content/drive')
+
+CACHE_BIN_PATH = "/content/drive/MyDrive/colab_bin"
+os.makedirs(CACHE_BIN_PATH, exist_ok=True)
+
+# 2. Tippecanoe 설치 (캐시 확인)
+if not os.path.exists('/usr/local/bin/tippecanoe'):
+    if os.path.exists(f"{CACHE_BIN_PATH}/tippecanoe"):
+        print("🚀 캐시된 Tippecanoe 바이너리를 복사합니다. (속도 향상)")
+        !cp {CACHE_BIN_PATH}/tippecanoe /usr/local/bin/
+        !chmod +x /usr/local/bin/tippecanoe
+    else:
+        print("📦 Tippecanoe 빌드 중... (최초 1회, 약 2~3분 소요)")
+        !git clone https://github.com/felt/tippecanoe.git > /dev/null 2>&1
+        !cd tippecanoe && make -j > /dev/null 2>&1 && make install > /dev/null 2>&1
+        # 빌드 완료 후 드라이브에 저장
+        !cp /usr/local/bin/tippecanoe {CACHE_BIN_PATH}/
+        print("✅ 빌드 완료 및 캐시 저장 성공")
+
+# 3. 필수 라이브러리 설치
+!pip install -q supabase boto3 ezdxf pandas ipywidgets requests pyproj shapely geopandas
+
+import os
+import io
+import time
+import math
+import json
+import uuid
+import base64
+import datetime
+import requests
+import subprocess
+import shutil
+import pandas as pd
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+from google.colab import drive
+from google.colab import files as colab_files
+from supabase import create_client
+import boto3
+import ezdxf
+from pyproj import Transformer
+from shapely.geometry import Point, LineString
+from shapely.ops import linemerge
+
+# ----------------------------------------------------------------------
+# 2. 설정 (서버에서 자동 로드)
+# ----------------------------------------------------------------------
+# 로컬 앱과 동일하게 Google Apps Script(GAS)에서 설정을 가져옵니다.
+BASE_URL = "https://script.google.com/macros/s/AKfycbwnV8CS2X_MYs5ZjOeTg7rBexOtjFeumTIcRJ4CWy-qPM4yV-G2pp_jcpyZoESI8cHq/exec"
+
+print("서버에서 설정 정보를 가져오는 중...")
+try:
+    # Supabase 설정 로드
+    res_supa = requests.get(BASE_URL, params={'action': 'getSupabaseConfig'}).json()
+    SUPABASE_URL = res_supa.get('url', '')
+    SUPABASE_KEY = res_supa.get('key', '')
+
+    # R2 설정 로드
+    res_r2 = requests.get(BASE_URL, params={'action': 'getR2Config'}).json()
+    R2_ENDPOINT = res_r2.get('R2_Endpoints', '')
+    R2_ACCESS_KEY = res_r2.get('R2_Access_Key_ID', '')
+    R2_SECRET_KEY = res_r2.get('R2_Secret_Access_Key', '')
+    R2_BUCKET_NAME = res_r2.get('R2_BUCKET_NAME', '')
+    R2_PUBLIC_URL = res_r2.get('R2_Public_Url', '')
+
+    if SUPABASE_URL and R2_ENDPOINT:
+        print("✅ 설정 로드 성공!")
+    else:
+        print("❌ 설정 로드 실패: API 응답을 확인하세요.")
+except Exception as e:
+    print(f"❌ 설정 로드 중 오류: {e}")
+    SUPABASE_URL = ""
+    SUPABASE_KEY = ""
+    R2_ENDPOINT = ""
+    R2_ACCESS_KEY = ""
+    R2_SECRET_KEY = ""
+    R2_BUCKET_NAME = ""
+    R2_PUBLIC_URL = ""
+
+# ----------------------------------------------------------------------
+# 3. Backend Classes (backend.py 로직 이식)
+# ----------------------------------------------------------------------
+
+class SupabaseManager:
+    def __init__(self, url, key):
+        self.client = None
+        self.enabled = False
+        if url and key:
+            try:
+                self.client = create_client(url, key)
+                self.enabled = True
+            except Exception as e:
+                print(f"[Supabase] 연결 실패: {e}")
+
+    def get_cad_projects(self):
+        if not self.enabled: return []
+        try:
+            res = self.client.table("cad_projects").select("*").order("created_at", desc=True).execute()
+            projects = []
+            for p in res.data:
+                # 간단하게 객체 수 카운트 (상세 로직은 생략하거나 필요시 추가)
+                projects.append({
+                    'id': p['id'],
+                    'name': p['name'],
+                    'created_at': p['created_at'],
+                    'status': p.get('status', 'active')
+                })
+            return projects
+        except Exception as e:
+            print(f"[Supabase] 프로젝트 조회 오류: {e}")
+            return []
+
+    def get_cad_files(self, project_id):
+        if not self.enabled: return []
+        try:
+            res = self.client.table("cad_files").select("*").eq("project_id", project_id).order("updated_at", desc=True).execute()
+            return res.data
+        except Exception as e:
+            print(f"[Supabase] 파일 조회 오류: {e}")
+            return []
+
+    def create_cad_project(self, name):
+        if not self.enabled: return None
+        try:
+            res = self.client.table("cad_projects").insert({"name": name, "status": "active"}).execute()
+            if res.data: return res.data[0]
+        except Exception as e:
+            print(f"[Supabase] 프로젝트 생성 오류: {e}")
+        return None
+
+    def delete_cad_project(self, project_id):
+        if not self.enabled: return False
+        try:
+            self.client.table("cad_files").delete().eq("project_id", project_id).execute()
+            self.client.table("cad_projects").delete().eq("id", project_id).execute()
+            return True
+        except Exception as e:
+            print(f"[Supabase] 프로젝트 삭제 오류: {e}")
+            return False
+
+    def upsert_cad_file_metadata(self, project_id, file_type, file_path, file_size, source_crs=None):
+        if not self.enabled: return
+        try:
+            data = {
+                "project_id": project_id,
+                "file_type": file_type,
+                "file_path": file_path,
+                "file_size": file_size,
+                "source_crs": source_crs,
+                "updated_at": "now()",
+                "cache_expiry": (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=365)).isoformat()
+            }
+            # upsert 시도
+            try:
+                self.client.table("cad_files").upsert(data, on_conflict="file_path").execute()
+            except Exception:
+                # 실패 시 (권한 등) 기존 방식 시도
+                pass
+        except Exception as e:
+            print(f"[Supabase] 메타데이터 업데이트 오류: {e}")
+
+    def delete_cad_file(self, file_path):
+        if not self.enabled: return
+        try:
+            self.client.table("cad_files").delete().eq("file_path", file_path).execute()
+        except Exception as e:
+            print(f"[Supabase] 파일 삭제 오류: {e}")
+
+class R2Manager:
+    def __init__(self, endpoint, access_key, secret_key, bucket):
+        self.client = None
+        self.bucket_name = bucket
+        self.enabled = False
+        if endpoint and access_key:
+            try:
+                self.client = boto3.client(
+                    's3',
+                    endpoint_url=endpoint,
+                    aws_access_key_id=access_key,
+                    aws_secret_access_key=secret_key,
+                    region_name='auto'
+                )
+                self.enabled = True
+            except Exception as e:
+                print(f"[R2] 연결 실패: {e}")
+
+    def upload_file(self, file_name, file_data, content_type='application/octet-stream'):
+        if not self.enabled: return False
+        try:
+            if hasattr(file_data, 'seek'): file_data.seek(0)
+            self.client.put_object(
+                Bucket=self.bucket_name,
+                Key=file_name,
+                Body=file_data,
+                ContentType=content_type,
+                CacheControl="public, max-age=31536000"
+            )
+            return True
+        except Exception as e:
+            print(f"[R2] 업로드 실패: {e}")
+            return False
+
+    def delete_file(self, file_name):
+        if not self.enabled: return False
+        try:
+            self.client.delete_object(Bucket=self.bucket_name, Key=file_name)
+            return True
+        except Exception as e:
+            print(f"[R2] 삭제 실패: {e}")
+            return False
+
+    def list_objects(self, prefix):
+        if not self.enabled: return []
+        try:
+            paginator = self.client.get_paginator('list_objects_v2')
+            pages = paginator.paginate(Bucket=self.bucket_name, Prefix=prefix)
+            keys = []
+            for page in pages:
+                if 'Contents' in page:
+                    for obj in page['Contents']:
+                        keys.append(obj['Key'])
+            return keys
+        except Exception as e:
+            print(f"[R2] 목록 조회 실패: {e}")
+            return []
+
+def get_chainage_details(line_geom, pt_geom, total_length, reverse=False):
+    """체인리지, 방향, 오프셋 계산"""
+    try:
+        dist = line_geom.project(pt_geom)
+        offset = line_geom.distance(pt_geom)
+
+        proj_pt = line_geom.interpolate(dist)
+
+        delta = 0.1
+        if dist + delta <= total_length:
+            next_pt = line_geom.interpolate(dist + delta)
+            vec_line = (next_pt.x - proj_pt.x, next_pt.y - proj_pt.y)
+        else:
+            prev_pt = line_geom.interpolate(dist - delta)
+            vec_line = (proj_pt.x - prev_pt.x, proj_pt.y - prev_pt.y)
+
+        vec_pt = (pt_geom.x - proj_pt.x, pt_geom.y - proj_pt.y)
+        cross_prod = vec_line[0] * vec_pt[1] - vec_line[1] * vec_pt[0]
+
+        direction_str = "중앙"
+        if cross_prod < 0: direction_str = "우"
+        elif cross_prod > 0: direction_str = "좌"
+
+        final_dist = total_length - dist if reverse else dist
+        km = int(final_dist / 1000)
+        m = final_dist % 1000
+
+        # [동기화] 정밀도 및 포맷 통일 (0+000.000)
+        return f"{km}+{m:07.3f}/상행({direction_str})/{offset:.3f}"
+    except:
+        return None
+
+# 매니저 인스턴스 생성
+db = SupabaseManager(SUPABASE_URL, SUPABASE_KEY)
+r2 = R2Manager(R2_ENDPOINT, R2_ACCESS_KEY, R2_SECRET_KEY, R2_BUCKET_NAME)
+
+# ----------------------------------------------------------------------
+# 4. UI 및 로직 (ipywidgets)
+# ----------------------------------------------------------------------
+
+# UI 위젯 정의
+title_lbl = widgets.HTML("<h2>🏗️ AsinTech CAD Management (Colab Edition)</h2>")
+
+# 프로젝트 섹션
+project_dropdown = widgets.Dropdown(description="프로젝트:", style={'description_width': 'initial'}, layout=widgets.Layout(width='50%'))
+refresh_btn = widgets.Button(description="새로고침", icon="refresh")
+create_proj_btn = widgets.Button(description="프로젝트 생성", icon="plus")
+delete_proj_btn = widgets.Button(description="프로젝트 삭제", icon="trash", button_style='danger')
+project_output = widgets.Output()
+
+# 파일 섹션
+file_list_output = widgets.Output()
+
+# 업로드 섹션
+upload_type_radio = widgets.RadioButtons(
+    options=['Google Drive (마운트 필요)', 'Local Upload (Colab 임시 저장소)'],
+    value='Local Upload (Colab 임시 저장소)',
+    description='파일 소스:',
+    disabled=False
+)
+drive_path_input = widgets.Text(
+    value='/content/drive/MyDrive/CAD_Data',
+    placeholder='Google Drive 폴더 경로',
+    description='Drive 경로:',
+    disabled=True,
+    layout=widgets.Layout(width='70%')
+)
+upload_btn = widgets.Button(description="파일 업로드 실행", button_style='primary', icon="upload")
+upload_output = widgets.Output()
+
+# 변환 설정 섹션
+crs_radio = widgets.RadioButtons(
+    options=[('EPSG:5187 (동부)', 'EPSG:5187'), ('EPSG:5186 (중부)', 'EPSG:5186'), ('EPSG:5185 (서부)', 'EPSG:5185'), ('EPSG:5179 (UTM-K)', 'EPSG:5179')],
+    value='EPSG:5187',
+    description='좌표계:',
+    disabled=True
+)
+layer_dropdown = widgets.Dropdown(
+    description='중심선 레이어:',
+    options=['(파일 업로드 필요)'],
+    disabled=True,
+    style={'description_width': 'initial'}
+)
+reverse_check = widgets.Checkbox(value=False, description='역방향 계산 (Reverse)', disabled=True)
+target_layers_select = widgets.SelectMultiple(
+    description='변환 대상 레이어:',
+    options=['(파일 업로드 필요)'],
+    disabled=True,
+    style={'description_width': 'initial'},
+    layout=widgets.Layout(width='70%', height='150px')
+)
+select_all_btn = widgets.Button(description="전체 선택", icon="check-square", disabled=True, layout=widgets.Layout(width='120px'))
+deselect_all_btn = widgets.Button(description="전체 해제", icon="square", disabled=True, layout=widgets.Layout(width='120px'))
+
+cache_options = [("캐시 안함", "no-cache"), ("1년 (권장)", "public, max-age=31536000")]
+cache_radio = widgets.RadioButtons(options=cache_options, value="public, max-age=31536000", description='캐시 정책:', disabled=True)
+
+convert_btn = widgets.Button(description="변환 실행 (Colab Local)", button_style='success', icon="play", disabled=True)
+conversion_output = widgets.Output()
+
+# 전역 변수 (업로드된 파일 정보 저장용)
+current_upload_info = {'pid': None, 'layers': [], 'file_type': 'dxf'}
+
+# --- 이벤트 핸들러 ---
+
+def load_projects(b=None):
+    with project_output:
+        clear_output()
+        if not db.enabled:
+            print("DB 설정이 올바르지 않습니다.")
+            return
+        
+        projs = db.get_cad_projects()
+        options = [(f"[{p['id']}] {p['name']}", p['id']) for p in projs]
+        
+        if options:
+            project_dropdown.options = options
+            project_dropdown.value = options[0][1]
+            load_files(options[0][1])
+        else:
+            project_dropdown.options = []
+            print("프로젝트가 없습니다.")
+
+def on_project_change(change):
+    if change['type'] == 'change' and change['name'] == 'value':
+        load_files(change['new'])
+
+def load_files(project_id):
+    with file_list_output:
+        clear_output()
+        if not project_id: return
+        
+        files = db.get_cad_files(project_id)
+        if files:
+            df = pd.DataFrame(files)
+            # 보기 좋게 컬럼 선택 및 이름 변경
+            display_df = df[['file_path', 'file_type', 'file_size', 'updated_at']].copy()
+            display_df['file_size'] = (display_df['file_size'] / 1024).round(1).astype(str) + " KB"
+            display(display_df)
+        else:
+            print("등록된 파일이 없습니다.")
+
+def create_project(b):
+    # Colab에서는 input() 사용 시 EOFError가 발생할 수 있으므로 위젯 사용
+    with project_output:
+        clear_output()
+        name_input = widgets.Text(placeholder="새 프로젝트 이름", description="이름:")
+        ok_btn = widgets.Button(description="확인", button_style='success')
+        cancel_btn = widgets.Button(description="취소")
+        
+        def on_ok(btn):
+            name = name_input.value
+            if name:
+                res = db.create_cad_project(name)
+                if res:
+                    load_projects()
+                    with project_output:
+                        print(f"프로젝트 '{name}' 생성 완료.")
+                else:
+                    with project_output:
+                        print("생성 실패.")
+        
+        def on_cancel(btn):
+            clear_output()
+            
+        ok_btn.on_click(on_ok)
+        cancel_btn.on_click(on_cancel)
+        display(widgets.HBox([name_input, ok_btn, cancel_btn]))
+
+def delete_project(b):
+    pid = project_dropdown.value
+    if not pid: return
+    
+    # Find project name
+    p_name = "Unknown"
+    for label, val in project_dropdown.options:
+        if val == pid:
+            p_name = label
+            break
+
+    with project_output:
+        clear_output()
+        lbl = widgets.HTML(f"<b>⚠️ 경고: 프로젝트 '{p_name}'을(를) 삭제하시겠습니까?</b><br>연관된 모든 파일이 영구적으로 삭제됩니다.")
+        yes_btn = widgets.Button(description="예, 삭제합니다", button_style='danger')
+        no_btn = widgets.Button(description="취소")
+        
+        def on_yes(btn):
+            with project_output:
+                print("삭제 진행 중...")
+                # R2 Cleanup
+                try:
+                    keys = r2.list_objects("cad_data/")
+                    target_keys = [k for k in keys if f"_{pid}." in k or f"_{pid}_" in k]
+                    for k in target_keys:
+                        r2.delete_file(k)
+                except Exception as e:
+                    print(f"R2 정리 중 오류: {e}")
+                
+                # DB Delete
+                if db.delete_cad_project(pid):
+                    print("✅ 프로젝트 삭제 완료.")
+                    load_projects()
+                else:
+                    print("❌ 프로젝트 삭제 실패.")
+        
+        def on_no(btn):
+            clear_output()
+            print("취소되었습니다.")
+            
+        yes_btn.on_click(on_yes)
+        no_btn.on_click(on_no)
+        display(widgets.VBox([lbl, widgets.HBox([yes_btn, no_btn])]))
+
+def toggle_upload_source(change):
+    if change['new'] == 'Google Drive (마운트 필요)':
+        drive_path_input.disabled = False
+    else:
+        drive_path_input.disabled = True
+
+def upload_files(b):
+    project_id = project_dropdown.value
+    if not project_id:
+        with upload_output: print("프로젝트를 선택하세요.")
+        return
+
+    with upload_output:
+        clear_output()
+        source = upload_type_radio.value
+        uploaded_files = [] # (filename, data_bytes)
+
+        if "Google Drive" in source:
+            # Google Drive 모드
+            folder_path = drive_path_input.value
+            if not os.path.exists(folder_path):
+                print(f"경로를 찾을 수 없습니다: {folder_path}")
+                print("마운트가 되었는지, 경로가 정확한지 확인하세요.")
+                return
+            
+            # 폴더 내 DXF 파일 검색
+            try:
+                all_files = [f for f in os.listdir(folder_path) if f.lower().endswith('.dxf')]
+                if not all_files:
+                    print("해당 폴더에 .dxf 파일이 없습니다.")
+                    return
+                
+                # 파일 선택 위젯 (간단히 SelectMultiple 사용)
+                print(f"검색된 파일: {len(all_files)}개")
+                # 여기서는 편의상 폴더 내 모든 DXF를 대상으로 하거나, 
+                # 실제로는 별도 선택 UI가 필요하지만, 예제에서는 발견된 첫 번째 파일을 예시로 듭니다.
+                # 혹은 전체 업로드
+                for fname in all_files:
+                    full_path = os.path.join(folder_path, fname)
+                    with open(full_path, 'rb') as f:
+                        uploaded_files.append((fname, f.read()))
+            except Exception as e:
+                print(f"Drive 파일 읽기 오류: {e}")
+                return
+
+        else:
+            # Local Upload (Colab) 모드
+            # c:\Temp 대신 Colab의 파일 업로드 기능 사용
+            print("파일 선택 창이 뜨면 파일을 선택하세요...")
+            uploaded = colab_files.upload()
+            for fname, data in uploaded.items():
+                if fname.lower().endswith('.dxf'):
+                    uploaded_files.append((fname, data))
+        
+        # 업로드 처리
+        if not uploaded_files:
+            print("업로드할 DXF 파일이 없습니다.")
+            return
+
+        print(f"총 {len(uploaded_files)}개 파일 업로드 시작...")
+        extracted_layers = []
+        
+        for fname, data in uploaded_files:
+            # 기존 로직: 기존 데이터 삭제 후 업로드 (옵션이지만 여기선 덮어쓰기/추가)
+            # R2 Key 생성
+            key = f"cad_data/CAD_{project_id}.dxf" # 단일 파일 구조 가정 (기존 로직 참조)
+            # 만약 여러 파일이면 이름 유지: key = f"cad_data/{project_id}/{fname}"
+            
+            # 기존 앱 로직에 따라 CAD_{pid}.dxf 로 저장 (가장 마지막 파일이 덮어씀)
+            print(f"Uploading {fname} -> {key} ...")
+            
+            if r2.upload_file(key, io.BytesIO(data) if isinstance(data, bytes) else data, 'application/dxf'):
+                db.upsert_cad_file_metadata(project_id, 'dxf', key, len(data), source_crs=crs_radio.value)
+                print("성공.")
+                
+                # 마지막 DXF 파일의 레이어 분석
+                try:
+                    # ezdxf: ASCII DXF는 Text Stream, Binary DXF는 Binary Stream 필요
+                    if isinstance(data, bytes):
+                        if data.startswith(b'AutoCAD Binary DXF'):
+                            doc = ezdxf.read(io.BytesIO(data))
+                        else:
+                            try:
+                                doc = ezdxf.read(io.TextIOWrapper(io.BytesIO(data), encoding='cp949'))
+                            except:
+                                doc = ezdxf.read(io.TextIOWrapper(io.BytesIO(data), encoding='utf-8', errors='ignore'))
+                    else:
+                        doc = ezdxf.read(io.StringIO(data))
+                        
+                    extracted_layers = sorted(list(set([e.dxf.layer for e in doc.modelspace()])))
+                except Exception as e:
+                    print(f"레이어 분석 실패: {e}")
+            else:
+                print("실패.")
+        
+        print("모든 작업 완료.")
+        load_files(project_id)
+        
+        # 변환 UI 활성화
+        if extracted_layers:
+            current_upload_info['pid'] = project_id
+            current_upload_info['layers'] = extracted_layers
+            
+            layer_options = ['(선택 안함)'] + extracted_layers
+            layer_dropdown.options = layer_options
+            layer_dropdown.value = layer_options[0]
+            
+            # 변환 대상 레이어 설정 (전체 선택 상태가 기본)
+            target_layers_select.options = extracted_layers
+            target_layers_select.value = extracted_layers
+            
+            crs_radio.disabled = False
+            layer_dropdown.disabled = False
+            reverse_check.disabled = False
+            cache_radio.disabled = False
+            target_layers_select.disabled = False
+            select_all_btn.disabled = False
+            deselect_all_btn.disabled = False
+            convert_btn.disabled = False
+            print("✅ 레이어 분석 완료! 아래 '4. 변환 설정'에서 대상 레이어를 선택한 후 변환을 실행하세요.")
+
+def run_conversion(b):
+    with conversion_output:
+        clear_output()
+        pid = current_upload_info.get('pid')
+        if not pid:
+            print("업로드된 프로젝트가 없습니다.")
+            return
+        
+        selected_target_layers = list(target_layers_select.value)
+        if not selected_target_layers:
+            print("⚠️ 선택된 레이어가 없습니다. 변환할 레이어를 최소 하나 이상 선택해주세요.")
+            return
+
+        print(f"🚀 변환 작업 시작 (PID: {pid})")
+        print("1. DXF 파일 준비 중...")
+        
+        # R2에서 DXF 다운로드
+        dxf_key = f"cad_data/CAD_{pid}.dxf"
+        local_dxf = f"temp_{pid}.dxf"
+        
+        # 기존 파일 정리
+        if os.path.exists(local_dxf): os.remove(local_dxf)
+        
+        # 다운로드 (BytesIO -> File)
+        try:
+            # R2Manager에 download_file_to_path가 없으므로 get_object 사용
+            obj = r2.client.get_object(Bucket=r2.bucket_name, Key=dxf_key)
+            with open(local_dxf, 'wb') as f:
+                f.write(obj['Body'].read())
+        except Exception as e:
+            print(f"❌ DXF 다운로드 실패: {e}")
+            return
+
+        # 변환 설정
+        source_crs = crs_radio.value
+        target_crs = "EPSG:4326"
+        centerline_layer = None if layer_dropdown.value == '(선택 안함)' else layer_dropdown.value
+        is_reverse = reverse_check.value
+        cache_policy = cache_radio.value
+        
+        print(f"2. 좌표 변환 및 GeoJSON 생성 ({source_crs} -> {target_crs})...")
+        
+        try:
+            transformer = Transformer.from_crs(source_crs, target_crs, always_xy=True)
+            doc = ezdxf.readfile(local_dxf)
+            msp = doc.modelspace()
+            
+            # 중심선 처리
+            centerline_geom = None
+            centerline_len = 0
+            if centerline_layer:
+                print(f"   - 중심선 레이어 '{centerline_layer}' 분석 중...")
+                cl_lines = []
+                for e in msp.query(f'*[layer=="{centerline_layer}"]'):
+                    if e.dxftype() in ['LINE', 'LWPOLYLINE', 'POLYLINE']:
+                        try:
+                            pts = list(e.points()) if e.dxftype() != 'LWPOLYLINE' else list(e.get_points('xy'))
+                            if len(pts) >= 2:
+                                cl_lines.append(LineString([(p[0], p[1]) for p in pts]))
+                        except: pass
+                if cl_lines:
+                    centerline_geom = linemerge(cl_lines)
+                    centerline_len = centerline_geom.length
+
+            # 엔티티 변환
+            features = {'Point': [], 'LineString': [], 'Polygon': []}
+            
+            def process_entity(e):
+                if e.dxftype() == 'INSERT':
+                    # 블록 내부 객체도 레이어 필터링 적용 여부 확인 (일반적으로 블록 레이어 기준)
+                    if e.dxf.layer not in selected_target_layers: return
+                    for sub in e.virtual_entities(): process_entity(sub)
+                    return
+                
+                # 레이어 필터링
+                if e.dxf.layer not in selected_target_layers: return
+                
+                dxftype = e.dxftype()
+                if dxftype not in ['TEXT', 'MTEXT', 'POINT', 'CIRCLE', 'LWPOLYLINE', 'LINE', 'POLYLINE', 'ARC', 'SPLINE']: return
+
+                # [NEW] Special handling for polylines with width (synchronizing from convert_r2.py)
+                if dxftype in ['LWPOLYLINE', 'POLYLINE']:
+                    segments = []
+                    if dxftype == 'LWPOLYLINE' and e.has_width:
+                        pts = list(e.get_points('xyseb'))
+                        for i in range(len(pts) - 1):
+                            segments.append({
+                                'p1': (pts[i][0], pts[i][1]), 'p2': (pts[i+1][0], pts[i+1][1]),
+                                'w1': pts[i][2], 'w2': pts[i][3]
+                            })
+                    elif dxftype == 'POLYLINE':
+                        verts = list(e.vertices)
+                        if any(v.dxf.start_width > 0 or v.dxf.end_width > 0 for v in verts):
+                            for i in range(len(verts) - 1):
+                                segments.append({
+                                    'p1': verts[i].dxf.location[:2], 'p2': verts[i+1].dxf.location[:2],
+                                    'w1': verts[i].dxf.start_width, 'w2': verts[i].dxf.end_width
+                                })
+
+                    if segments:
+                        processed_as_polygon = False
+                        for seg in segments:
+                            w1, w2 = seg['w1'], seg['w2']
+                            if w1 <= 0 and w2 <= 0: continue
+                            p1, p2 = seg['p1'], seg['p2']
+                            dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+                            length = math.hypot(dx, dy)
+                            if length == 0: continue
+                            nx, ny = -dy / length, dx / length
+                            v = [
+                                (p1[0] + nx * w1 / 2, p1[1] + ny * w1 / 2),
+                                (p2[0] + nx * w2 / 2, p2[1] + ny * w2 / 2),
+                                (p2[0] - nx * w2 / 2, p2[1] - ny * w2 / 2),
+                                (p1[0] - nx * w1 / 2, p1[1] - ny * w1 / 2)
+                            ]
+                            poly_coords = [transformer.transform(pt[0], pt[1]) for pt in v]
+                            poly_coords.append(poly_coords[0])
+                            poly_props = {
+                                "handle": e.dxf.handle, 
+                                "layer": e.dxf.layer, 
+                                "dxftype": f"Polygon_from_{dxftype}",
+                                "color": e.dxf.get('color', 256)
+                            }
+                            features['Polygon'].append({"type": "Feature", "geometry": {"type": "Polygon", "coordinates": [poly_coords]}, "properties": poly_props})
+                            processed_as_polygon = True
+                        if processed_as_polygon: return
+                
+                geom_type = None
+                coords = []
+                props = {
+                    "handle": e.dxf.handle,
+                    "layer": e.dxf.layer,
+                    "dxftype": dxftype,
+                    "color": e.dxf.get('color', 256)
+                }
+                
+                # [동기화] 회전 및 정렬 정보 추가
+                if e.dxf.hasattr('rotation'):
+                    props['rotation'] = -float(e.dxf.rotation)
+                if dxftype == 'TEXT':
+                    props['align_h'] = e.dxf.halign
+                    props['align_v'] = e.dxf.valign
+                
+                # 텍스트 내용
+                if dxftype in ['TEXT', 'MTEXT']:
+                    props['text'] = e.dxf.text if dxftype == 'TEXT' else e.text
+
+                # 좌표 변환 로직 (간소화)
+                pts = []
+                if dxftype == 'LINE':
+                    pts = [e.dxf.start, e.dxf.end]
+                    geom_type = "LineString"
+                elif dxftype in ['LWPOLYLINE', 'POLYLINE']:
+                    pts = list(e.points()) if dxftype == 'POLYLINE' else list(e.get_points('xy'))
+                    geom_type = "LineString"
+                elif dxftype in ['POINT', 'TEXT', 'MTEXT', 'CIRCLE']:
+                    p = e.dxf.insert if dxftype in ['TEXT', 'MTEXT'] else (e.dxf.center if dxftype == 'CIRCLE' else e.dxf.location)
+                    pts = [p]
+                    geom_type = "Point"
+                
+                # 체인리지 계산 (Point 타입이고 중심선이 있을 때)
+                if geom_type == "Point" and centerline_geom and len(pts) > 0:
+                    try:
+                        pt_obj = Point(pts[0][0], pts[0][1])
+                        c_info = get_chainage_details(centerline_geom, pt_obj, centerline_len, is_reverse)
+                        if c_info: props['chainage'] = c_info
+                    except: pass
+
+                # 투영 변환
+                for p in pts:
+                    lon, lat = transformer.transform(p[0], p[1])
+                    coords.append([lon, lat])
+                
+                if not coords: return
+                
+                if geom_type == "Point":
+                    coords = coords[0]
+                
+                features[geom_type].append({
+                    "type": "Feature",
+                    "geometry": {"type": geom_type, "coordinates": coords},
+                    "properties": props
+                })
+
+            for e in msp: process_entity(e)
+            
+            # GeoJSON 저장
+            geojson_files = []
+            if features['Polygon']:
+                with open("temp_polygon.geojson", "w", encoding="utf-8") as f:
+                    json.dump({"type": "FeatureCollection", "features": features['Polygon']}, f, ensure_ascii=False)
+                geojson_files.append(("temp_polygon.geojson", "polygon"))
+
+            if features['Point']:
+                with open("temp_point.geojson", "w", encoding="utf-8") as f:
+                    json.dump({"type": "FeatureCollection", "features": features['Point']}, f, ensure_ascii=False)
+                geojson_files.append(("temp_point.geojson", "point"))
+            
+            if features['LineString']:
+                with open("temp_line.geojson", "w", encoding="utf-8") as f:
+                    json.dump({"type": "FeatureCollection", "features": features['LineString']}, f, ensure_ascii=False)
+                geojson_files.append(("temp_line.geojson", "line"))
+                
+            if not geojson_files:
+                print("❌ 변환할 데이터가 없습니다.")
+                return
+
+        except Exception as e:
+            print(f"❌ 변환 중 오류 발생: {e}")
+            return
+
+        print("3. Tippecanoe 실행 (PMTiles 생성)...")
+        pm_path = f"output_{pid}.pmtiles"
+        cmd = [
+            "tippecanoe", "-o", pm_path,
+            "-z22", "--drop-densest-as-needed", "--extend-zooms-if-still-dropping", "--force",
+            "--no-line-simplification", "--no-tiny-polygon-reduction", "-r1"
+        ]
+        for gj, layer in geojson_files:
+            cmd.extend(["-L", f"{layer}:{gj}"])
+            
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            print(f"❌ Tippecanoe 실행 실패: {e.stderr.decode()}")
+            return
+
+        print("4. R2 업로드 및 메타데이터 갱신...")
+        r2_key = f"cad_data/cad_{pid}_Data.pmtiles"
+        try:
+            with open(pm_path, 'rb') as f:
+                r2.upload_file(r2_key, f, 'application/vnd.pmtiles') # cache_control은 upload_file 수정 필요 혹은 기본값 사용
+                # R2Manager.upload_file에 cache_control 인자가 없으므로 put_object 직접 호출 권장하나, 
+                # 여기선 기존 upload_file 사용 (CacheControl 고정됨). 필요시 R2Manager 수정.
+                # 위 R2Manager 클래스 정의를 보면 CacheControl="public, max-age=31536000" 고정임.
+            
+            db.upsert_cad_file_metadata(pid, 'pmtiles', r2_key, os.path.getsize(pm_path), source_crs=source_crs)
+            print("✅ 모든 작업 완료!")
+            
+            # 임시 파일 정리
+            for f in [local_dxf, pm_path, "temp_point.geojson", "temp_line.geojson", "temp_polygon.geojson"]:
+                if os.path.exists(f): os.remove(f)
+                
+            load_files(pid)
+            
+        except Exception as e:
+            print(f"❌ 업로드 실패: {e}")
+
+def on_select_all(b):
+    target_layers_select.value = target_layers_select.options
+
+def on_deselect_all(b):
+    target_layers_select.value = []
+
+# --- 위젯 연결 ---
+refresh_btn.on_click(load_projects)
+create_proj_btn.on_click(create_project)
+delete_proj_btn.on_click(delete_project)
+project_dropdown.observe(on_project_change, names='value')
+upload_type_radio.observe(toggle_upload_source, names='value')
+upload_btn.on_click(upload_files)
+convert_btn.on_click(run_conversion)
+select_all_btn.on_click(on_select_all)
+deselect_all_btn.on_click(on_deselect_all)
+
+# --- 레이아웃 구성 ---
+header = widgets.HBox([project_dropdown, refresh_btn, create_proj_btn, delete_proj_btn])
+upload_ctrl = widgets.VBox([
+    upload_type_radio,
+    drive_path_input,
+    upload_btn
+])
+
+conversion_ctrl = widgets.VBox([
+    crs_radio,
+    target_layers_select,
+    widgets.HBox([select_all_btn, deselect_all_btn]),
+    layer_dropdown,
+    reverse_check,
+    cache_radio,
+    convert_btn
+])
+
+main_ui = widgets.VBox([
+    title_lbl,
+    widgets.HTML("<hr>"),
+    widgets.HTML("<h3>1. 프로젝트 선택</h3>"),
+    header,
+    project_output,
+    widgets.HTML("<br><h3>2. 파일 목록</h3>"),
+    file_list_output,
+    widgets.HTML("<hr>"),
+    widgets.HTML("<h3>3. 파일 업로드 (DXF)</h3>"),
+    upload_ctrl,
+    upload_output,
+    widgets.HTML("<hr>"),
+    widgets.HTML("<h3>4. 변환 설정 (Colab Local)</h3>"),
+    conversion_ctrl,
+    conversion_output
+])
+
+# 초기 데이터 로드
+load_projects()
+
+# 화면 표시
+clear_output()
+display(main_ui)

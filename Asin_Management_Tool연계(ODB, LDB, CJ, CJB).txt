@@ -1,0 +1,819 @@
+;;; ==========================================================================
+;;; [AsinTech Management Tool 연계 시스템]
+;;; 지원 환경: AutoCAD Map 3D 2000 이상
+;;; 
+;;; [명령어 가이드]
+;;; 1. ODB (Object Database Export)
+;;;    - 용도: 사용자가 화면에서 직접 선택한 객체들을 DXF 파일로 내보냅니다.
+;;;    - 경로: C:\Temp\asin_autocad_data.dxf (중복 시 번호 자동 부여)
+;;;
+;;; 2. LDB (Layer Database Export)
+;;;    - 용도: 도면 내 레이어 목록을 팝업으로 띄워, 선택한 레이어의 모든 객체를 DXF로 내보냅니다.
+;;;    - 경로: C:\Temp\asin_autocad_data.dxf (중복 시 번호 자동 부여)
+;;;
+;;; 3. CJB (CAD to GeoJSON-B) - [권장: JSONB 최적화 포맷]
+;;;    - 용도: 선택한 객체의 속성(OD)을 'od_attributes'라는 단일 JSONB 필드로 묶어 추출합니다.
+;;;    - 특징: PostgreSQL의 JSONB 컬럼 관리에 최적화되어 있으며, 데이터 구조 변경에 유연합니다.
+;;;    - 경로: 사용자 지정 저장 (GeoJSON 확장자, UTF-8 No BOM 인코딩 자동 변환)
+;;;
+;;; 4. CJ (CAD to GeoJSON) - [표준 펼침 포맷]
+;;;    - 용도: 선택한 객체의 모든 속성을 개별 컬럼으로 펼쳐서 GeoJSON으로 추출합니다.
+;;;    - 특징: QGIS 등에서 즉시 일반 테이블 형태로 확인하기 좋습니다.
+;;;    - 경로: 사용자 지정 저장 (GeoJSON 확장자, UTF-8 No BOM 인코딩 자동 변환)
+;;;
+;;; [주요 개선 사항]
+;;; - 지능형 필드 필터링: 선택된 객체에 실제로 값이 존재하는 OD 테이블만 필드 선택창에 표시합니다.
+;;; - 계층형 UI 지원: 필드 선택 대화상자에서 [+] 헤더를 통해 그룹 선택 및 더블클릭 확장/축소를 지원합니다.
+;;; - 공간 데이터 호환성: PostGIS 연동을 위해 geometry 데이터와 별도로 WKT 필드를 함께 생성합니다.
+;;; - 인코딩 최적화: PowerShell 연동을 통해 한글 깨짐 없는 UTF-8(표준) 형식을 보장합니다.
+;;;
+;;; [시스템 요구사항]
+;;; - C:\Temp 폴더가 존재해야 합니다.
+;;; - PowerShell 실행 권한이 필요합니다.
+;;; ==========================================================================
+
+;;; Common Export Function
+(defun asin-export-dxf (ss / base_path dxf_path counter)
+  (if ss
+    (progn
+      ;; 1. Prepare File Path
+      (setq base_path "C:\\Temp\\asin_autocad_data")
+      (setq dxf_path (strcat base_path ".dxf"))
+      (setq counter 1)
+      
+      (while (findfile dxf_path)
+        (setq dxf_path (strcat base_path "(" (itoa counter) ")" ".dxf"))
+        (setq counter (1+ counter))
+      )
+      
+      ;; 2. Export DXF
+      (command "_.DXFOUT" dxf_path "_O" ss "" "_V" "2000" "16")
+      (princ (strcat "\n[성공] DXF 파일이 생성되었습니다: " dxf_path))
+      (princ (strcat "\n[정보] " (itoa (sslength ss)) "개의 객체가 선택되었습니다."))
+    )
+    (princ "\n[정보] 선택된 객체가 없습니다.")
+  )
+)
+
+(defun c:ODB (/ ss)
+  (vl-load-com) ; Load Visual LISP extensions
+
+  ;; 1. Select Objects
+  (prompt "\nDXF로 내보낼 객체를 선택하세요: ")
+  (setq ss (ssget))
+  (asin-export-dxf ss)
+  (princ)
+)
+
+(defun c:LDB (/ layers selected-layers filter ss get-all-layers select-layers-dialog)
+  (vl-load-com)
+
+  ;; Helper: Get all layers
+  (defun get-all-layers (/ lay lst)
+    (while (setq lay (tblnext "LAYER" (not lay)))
+      (setq lst (cons (cdr (assoc 2 lay)) lst))
+    )
+    (acad_strlsort lst)
+  )
+
+  ;; Helper: Show DCL dialog
+  (defun select-layers-dialog (layer-list / dcl_id fname f selected-indices result)
+    (setq fname (vl-filename-mktemp "layers.dcl"))
+    (setq f (open fname "w"))
+    (write-line "layer_sel : dialog { label = \"내보낼 레이어 선택\";" f)
+    (write-line " : list_box { key = \"laylist\"; multiple_select = true; width = 40; height = 20; }" f)
+    (write-line " ok_cancel; }" f)
+    (close f)
+    
+    (setq dcl_id (load_dialog fname))
+    (if (not (new_dialog "layer_sel" dcl_id)) (exit))
+    
+    (start_list "laylist")
+    (mapcar 'add_list layer-list)
+    (end_list)
+    
+    (action_tile "laylist" "(setq selected-indices $value)")
+    
+    (if (= (start_dialog) 1)
+      (if selected-indices
+        (setq result (mapcar '(lambda (n) (nth n layer-list)) (read (strcat "(" selected-indices ")"))))
+      )
+    )
+    (unload_dialog dcl_id)
+    (vl-file-delete fname)
+    result
+  )
+
+  ;; Main LDB Logic
+  (setq layers (get-all-layers))
+  (setq selected-layers (select-layers-dialog layers))
+  
+  (if selected-layers
+    (progn
+      ;; Construct filter string
+      (setq filter "")
+      (foreach lay selected-layers
+        (setq filter (strcat filter lay ","))
+      )
+      (setq filter (substr filter 1 (1- (strlen filter))))
+      
+      (prompt (strcat "\n선택한 레이어의 객체를 추출 중: " filter))
+      (setq ss (ssget "X" (list (cons 8 filter))))
+      (asin-export-dxf ss)
+    )
+    (princ "\n취소되었습니다.")
+  )
+  (princ)
+)
+;;; ==========================================================================
+;;; Command: CJB
+;;; Description: 기본 속성 및 OD 데이터를 JSONB 형태로 묶어 QGIS용 GeoJSON 추출
+;;; ==========================================================================
+
+(defun c:CJB (/ ss path fname f i len en ent type handle layer block text x y rot geom pts p1 p2 now date_part time_part dwg_name json_str pt align_h align_v sel_flds sys_flds od_flds fld val f_key first_item disp_list data_list od_map tbl f_name f_list od_json_props)
+  (vl-load-com)
+
+  ;; Helper: String Replace for JSON escaping
+  (defun string-replace (old new str / pos)
+    (setq pos 0)
+    (while (setq pos (vl-string-search old str pos))
+      (setq str (strcat (substr str 1 pos) new (substr str (+ 1 pos (strlen old)))))
+      (setq pos (+ pos (strlen new)))
+    )
+    str
+  )
+
+  (defun escape-json (str)
+    (setq str (string-replace "\\" "\\\\" str))
+    (setq str (string-replace "\"" "\\\"" str))
+    str
+  )
+
+  ;; Helper: Field Selection Dialog with Expansion Support
+  (defun select-fields-dialog (group-list / dcl_id fname f loop_res expanded_headers disp_list data_list selected_indices last_clicked_idx result)
+    (setq fname (vl-filename-mktemp "fields.dcl"))
+    (setq f (open fname "w"))
+    (write-line "fld_sel : dialog { label = \"내보낼 필드(속성) 선택\";" f)
+    (write-line " : text { label = \"헤더 선택: 그룹 전체 포함 / 더블클릭: 상세 필드 확장\"; }" f)
+    (write-line " : list_box { key = \"fldlist\"; multiple_select = true; width = 70; height = 30; }" f)
+    (write-line " : button { label = \"선택 항목 확장/축소 (Toggle Expansion)\"; key = \"btn_toggle\"; }" f)
+    (write-line " ok_cancel; }" f)
+    (close f)
+    
+    (setq expanded_headers '())
+    (setq selected_indices "")
+    (setq loop_res 2) ; Initialize to toggle mode
+
+    (while (= loop_res 2)
+      (setq dcl_id (load_dialog fname))
+      (if (not (new_dialog "fld_sel" dcl_id)) (exit))
+      
+      ;; Build Tree View Strings
+      (setq disp_list '() data_list '())
+      (foreach grp group-list
+        (setq h_name (car grp) flds (cdr grp))
+        (if (member h_name expanded_headers)
+          (progn
+            (setq disp_list (append disp_list (list (strcat "[-] " h_name))))
+            (setq data_list (append data_list (list (cons "HEAD" grp))))
+            (foreach f flds
+              (setq d_name f)
+              (while (vl-string-search ":" d_name) (setq d_name (substr d_name (+ 2 (vl-string-search ":" d_name)))))
+              (setq disp_list (append disp_list (list (strcat "    " d_name))))
+              (setq data_list (append data_list (list (cons "ITEM" f))))
+            )
+          )
+          (progn
+            (setq disp_list (append disp_list (list (strcat "[+] " h_name))))
+            (setq data_list (append data_list (list (cons "HEAD" grp))))
+          )
+        )
+      )
+      
+      (start_list "fldlist") (mapcar 'add_list disp_list) (end_list)
+      (set_tile "fldlist" selected_indices)
+
+      (action_tile "fldlist" 
+        "(setq selected_indices $value)
+         (setq last_clicked_idx (car (read (strcat \"(\" $value \")\"))))
+         (if (= $reason 4) (done_dialog 2))"
+      )
+      (action_tile "btn_toggle" "(done_dialog 2)")
+      (action_tile "accept" "(done_dialog 1)")
+      (action_tile "cancel" "(done_dialog 0)")
+      
+      (setq loop_res (start_dialog))
+      (unload_dialog dcl_id)
+
+      (if (= loop_res 2)
+        (progn
+          (setq target (nth last_clicked_idx data_list))
+          (if (and target (= (car target) "HEAD"))
+            (progn
+              (setq h_name (cadr target))
+              (if (member h_name expanded_headers)
+                (setq expanded_headers (vl-remove h_name expanded_headers))
+                (setq expanded_headers (cons h_name expanded_headers))
+              )
+            )
+          )
+          (setq selected_indices "") 
+        )
+      )
+    )
+    
+    (vl-file-delete fname)
+    (if (= loop_res 1)
+      (progn
+        (setq result '())
+        (foreach idx (read (strcat "(" selected_indices ")"))
+          (setq item (nth idx data_list))
+          (if (= (car item) "HEAD")
+            (foreach f (cddr item) (if (not (member f result)) (setq result (cons f result))))
+            (if (not (member (cdr item) result)) (setq result (cons (cdr item) result)))
+          )
+        )
+        (reverse result)
+      )
+      nil
+    )
+  )
+
+  ;; Helper to build nested OD JSON structure
+  (defun build-od-json-properties (en selected-od-fields / od_props_map tbl_name fld_name od_val json_od_str)
+    (setq od_props_map '()) ; List of (table_name . ( (field_name . value) ... ))
+
+    (foreach fld selected-od-fields
+      (setq sub (substr fld 4)) ; Remove "OD:"
+      (setq pos (vl-string-search ":" sub))
+      (setq tbl_name (substr sub 1 pos))
+      (setq fld_name (substr sub (+ pos 2)))
+
+      (if (and ade_odgetfield (member (strcase tbl_name) (mapcar 'strcase (ade_odtablelist))))
+        (if (> (ade_odrecordqty en tbl_name) 0)
+          (progn
+            (setq od_val (ade_odgetfield en tbl_name fld_name 0))
+            (if od_val
+              (progn
+                (setq od_val (escape-json (vl-princ-to-string od_val)))
+                ;; Find if table already exists in od_props_map
+                (setq existing_tbl_entry (assoc tbl_name od_props_map))
+                (if existing_tbl_entry
+                  ;; Add field to existing table entry
+                  (setq od_props_map (subst (cons tbl_name (cons (cons fld_name od_val) (cdr existing_tbl_entry))) existing_tbl_entry od_props_map))
+                  ;; Create new table entry
+                  (setq od_props_map (cons (cons tbl_name (list (cons fld_name od_val))) od_props_map))
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+
+    ;; Convert od_props_map to JSON string
+    (setq json_od_str "{")
+    (setq first_tbl t)
+    (foreach tbl_entry od_props_map
+      (if (not first_tbl) (setq json_od_str (strcat json_od_str ",")))
+      (setq json_od_str (strcat json_od_str "\"" (car tbl_entry) "\": {"))
+      (setq first_fld t)
+      (foreach fld_entry (cdr tbl_entry)
+        (if (not first_fld) (setq json_od_str (strcat json_od_str ",")))
+        (setq json_od_str (strcat json_od_str "\"" (car fld_entry) "\": \"" (cdr fld_entry) "\""))
+        (setq first_fld nil)
+      )
+      (setq json_od_str (strcat json_od_str "}"))
+      (setq first_tbl nil)
+    )
+    (setq json_od_str (strcat json_od_str "}"))
+    json_od_str
+  )
+
+  ;; 1. Select Objects
+  (prompt "\nJSONB로 추출할 객체를 선택하세요 (속성 분석 포함): ")
+  (setq ss (ssget))
+  
+  (if ss
+    (progn
+      ;; 2. Analyze Fields into Groups
+      (setq group_data '())
+      
+      ;; Group 1: Basic Properties (Rotation Removed)
+      (setq sys_flds '("SYS:HANDLE" "SYS:LAYER" "SYS:BLOCK_NAME" "SYS:TEXT" "SYS:X" "SYS:Y" "SYS:WKT"))
+      (setq group_data (cons (cons "BASIC PROPERTIES (기본 속성)" sys_flds) group_data))
+
+      ;; [개선] 선택된 객체들에 실제로 붙어있는 OD 테이블만 분석하여 노출
+      (if (and ade_odtablelist (ade_odtablelist))
+        (progn
+          (setq used_tables '() i_tmp 0)
+          (repeat (sslength ss)
+            (setq en_tmp (ssname ss i_tmp))
+            (foreach tbl (ade_odtablelist)
+              (if (and (not (member tbl used_tables)) (> (ade_odrecordqty en_tmp tbl) 0))
+                (setq used_tables (cons tbl used_tables))
+              )
+            )
+            (setq i_tmp (1+ i_tmp))
+          )
+          (foreach tbl (vl-sort used_tables '<)
+            (setq f_list (mapcar '(lambda (x) (strcat "OD:" tbl ":" (cdr (assoc "ColName" x)))) 
+                                 (cdr (assoc "Columns" (ade_odtabledefn tbl)))))
+            (setq group_data (append group_data (list (cons (strcat "OD TABLE: " tbl) (acad_strlsort f_list)))))
+          )
+        )
+      )
+      
+      (setq sel_flds (select-fields-dialog group_data))
+      (if (null sel_flds) (progn (princ "\n추출이 취소되었습니다.") (exit)))
+
+      ;; Separate SYS fields and OD fields
+      (setq sys_flds '() od_flds '())
+      (foreach fld sel_flds
+        (if (= (substr fld 1 4) "SYS:")
+          (setq sys_flds (cons fld sys_flds))
+          (setq od_flds (cons fld od_flds))
+        )
+      )
+      (setq sys_flds (reverse sys_flds))
+      (setq od_flds (reverse od_flds))
+
+      ;; 2. 저장 위치 및 파일명 사용자 지정 (getfiled 사용)
+      (setq fname (getfiled "GeoJSON 파일 저장 위치 및 이름 선택" "" "geojson" 1))
+      
+      (if (null fname) (progn (princ "\n파일 저장이 취소되었습니다.") (exit)))
+
+      (setq f (open fname "w"))
+      
+      (write-line "{ \"type\": \"FeatureCollection\", \"features\": [" f)
+      
+      (setq i 0)
+      (setq len (sslength ss))
+      
+      (while (< i len)
+        (setq en (ssname ss i))
+        (setq ent (entget en))
+        (setq type (cdr (assoc 0 ent)))
+        (setq handle (cdr (assoc 5 ent)))
+        (setq layer (escape-json (cdr (assoc 8 ent))))
+        
+        ;; Default Values
+        (setq block "null" text "null" x "null" y "null" rot "0.00" geom "null" wkt_val "null")
+        
+        ;; Coordinates & Rotation
+        (setq pt nil)
+        (if (assoc 10 ent)
+          (setq pt (cdr (assoc 10 ent)))
+        )
+        
+        ;; Alignment Info (72: Horizontal, 73: Vertical)
+        (setq align_h 0)
+        (setq align_v 0)
+        (if (assoc 72 ent) (setq align_h (cdr (assoc 72 ent))))
+        (if (assoc 73 ent) (setq align_v (cdr (assoc 73 ent))))
+        
+        (if pt
+          (progn
+            (setq x (rtos (car pt) 2 16))
+            (setq y (rtos (cadr pt) 2 16))
+          )
+        )
+
+        (if (assoc 50 ent)
+          (setq rot (rtos (* (cdr (assoc 50 ent)) (/ 180.0 pi)) 2 16)) ; Radian to Degree
+        )
+        
+        ;; Type specific handling
+        (cond
+          ((= type "INSERT")
+           (setq block (strcat "\"" (escape-json (cdr (assoc 2 ent))) "\""))
+           (setq geom (strcat "{\"type\": \"Point\", \"coordinates\": [" x ", " y "]}"))
+           (setq wkt_val (strcat "POINT(" x " " y ")"))
+          )
+          ((or (= type "TEXT") (= type "MTEXT"))
+           (setq text (strcat "\"" (escape-json (cdr (assoc 1 ent))) "\""))
+           (setq geom (strcat "{\"type\": \"Point\", \"coordinates\": [" x ", " y "]}"))
+           (setq wkt_val (strcat "POINT(" x " " y ")"))
+          )
+          ((= type "POINT")
+           (setq geom (strcat "{\"type\": \"Point\", \"coordinates\": [" x ", " y "]}"))
+           (setq wkt_val (strcat "POINT(" x " " y ")"))
+          )
+          ((= type "CIRCLE")
+           (setq geom (strcat "{\"type\": \"Point\", \"coordinates\": [" x ", " y "]}"))
+           (setq wkt_val (strcat "POINT(" x " " y ")"))
+          )
+          ((= type "LINE")
+           (setq p1 (cdr (assoc 10 ent)))
+           (setq p2 (cdr (assoc 11 ent)))
+           (setq geom (strcat "{\"type\": \"LineString\", \"coordinates\": [[" (rtos (car p1) 2 16) ", " (rtos (cadr p1) 2 16) "], [" (rtos (car p2) 2 16) ", " (rtos (cadr p2) 2 16) "]]}"))
+           (setq wkt_val (strcat "LINESTRING(" (rtos (car p1) 2 16) " " (rtos (cadr p1) 2 16) ", " (rtos (car p2) 2 16) " " (rtos (cadr p2) 2 16) ")"))
+          )
+          ((= type "LWPOLYLINE")
+           ;; Extract vertices
+           (setq pts "" wkt_pts "")
+           (foreach item ent
+             (if (= (car item) 10)
+               (progn
+                 (setq pts (strcat pts "[" (rtos (cadr item) 2 16) ", " (rtos (caddr item) 2 16) "], "))
+                 (setq wkt_pts (strcat wkt_pts (rtos (cadr item) 2 16) " " (rtos (caddr item) 2 16) ", "))
+               )
+             )
+           )
+           (if (> (strlen pts) 2)
+             (setq pts (substr pts 1 (- (strlen pts) 2))) ; Remove last comma
+           )
+           (if (> (strlen wkt_pts) 2)
+             (setq wkt_val (strcat "LINESTRING(" (substr wkt_pts 1 (- (strlen wkt_pts) 2)) ")"))
+           )
+           (setq geom (strcat "{\"type\": \"LineString\", \"coordinates\": [" pts "]}"))
+          )
+        )
+        
+        ;; Construct JSON Object (Only if geom is valid)
+        (if (and (/= geom "null") sel_flds)
+          (progn
+             (setq json_str "    { \"type\": \"Feature\", \"geometry\": ")
+             (setq json_str (strcat json_str geom ", \"properties\": { "))
+             (setq first_item t)
+             
+             ;; Add SYS fields
+             (foreach fld sys_flds
+                (setq val nil f_key nil)
+                (cond
+                   ((= fld "SYS:HANDLE") (setq f_key "HANDLE" val (strcat "\"" handle "\"")))
+                   ((= fld "SYS:LAYER") (setq f_key "LAYER" val (strcat "\"" layer "\"")))
+                   ((= fld "SYS:BLOCK_NAME") (setq f_key "BLOCK_NAME" val block))
+                   ((= fld "SYS:TEXT") (setq f_key "TEXT" val text))
+                   ((= fld "SYS:X") (setq f_key "X" val x))
+                   ((= fld "SYS:Y") (setq f_key "Y" val y))
+                   ((= fld "SYS:ROTATION") (setq f_key "ROTATION" val rot))
+                   ((= fld "SYS:WKT") (setq f_key "WKT" val (if (= wkt_val "null") "null" (strcat "\"" wkt_val "\""))))
+                )
+                
+                (if (and f_key val)
+                   (progn
+                      (if (not first_item) (setq json_str (strcat json_str ", ")))
+                      (setq json_str (strcat json_str "\"" (strcase f_key) "\": " val))
+                      (setq first_item nil)
+                   )
+                )
+             )
+             
+             ;; Add OD fields as a single JSONB string
+             (if od_flds
+               (progn
+                 (setq od_json_props (build-od-json-properties en od_flds))
+                 (if (not (equal od_json_props "{}")) ; Only add if there's actual OD data
+                   (progn
+                     (if (not first_item) (setq json_str (strcat json_str ", ")))
+                     (setq json_str (strcat json_str "\"od_attributes\": " od_json_props))
+                     (setq first_item nil)
+                   )
+                 )
+               )
+             )
+             
+             (setq json_str (strcat json_str " } }"))
+
+             ;; Add comma if not last
+             (if (< i (1- len))
+               (setq json_str (strcat json_str ","))
+             )
+             (write-line json_str f)
+          )
+        )
+        
+        (setq i (1+ i))
+      )
+      
+      (write-line "]}" f)
+      (close f)
+      
+      ;; [한글 깨짐 방지] 생성된 ANSI 파일을 UTF-8(No BOM)으로 변환
+      ;; PowerShell을 호출하여 QGIS 표준 인코딩으로 변환합니다.
+      (startapp "powershell.exe" 
+        (strcat "-WindowStyle Hidden -Command \"$content = Get-Content -Path '" fname "' -Encoding Default; [System.IO.File]::WriteAllLines('" fname "', $content, (New-Object System.Text.UTF8Encoding($false)))\""))
+      
+      (princ (strcat "\n[성공] QGIS용 GeoJSON (JSONB 형식) 생성됨: " fname))
+      (princ "\n[안내] PowerShell을 통해 UTF-8 인코딩 변환이 완료되었습니다.")
+    )
+    (princ "\n선택된 객체가 없습니다.")
+  )
+  (princ)
+)
+
+;;; ==========================================================================
+;;; Command: CJ
+;;; Description: 기본 속성 및 OD 데이터를 분석하여 QGIS용 GeoJSON 추출
+;;; ==========================================================================
+
+(defun c:CJ (/ ss path fname f i len en ent type handle layer block text x y rot geom pts p1 p2 now date_part time_part dwg_name json_str pt align_h align_v sel_flds fld val f_key first_item disp_list data_list sys_list od_map tbl f_name f_list)
+  (vl-load-com)
+
+  ;; Helper: String Replace for JSON escaping
+  (defun string-replace (old new str / pos)
+    (setq pos 0)
+    (while (setq pos (vl-string-search old str pos))
+      (setq str (strcat (substr str 1 pos) new (substr str (+ 1 pos (strlen old)))))
+      (setq pos (+ pos (strlen new)))
+    )
+    str
+  )
+
+  (defun escape-json (str)
+    (setq str (string-replace "\\" "\\\\" str))
+    (setq str (string-replace "\"" "\\\"" str))
+    str
+  )
+
+  ;; Helper: Field Selection Dialog with Expansion Support
+  (defun select-fields-dialog (group-list / dcl_id fname f loop_res expanded_headers disp_list data_list selected_indices last_clicked_idx result)
+    (setq fname (vl-filename-mktemp "fields.dcl"))
+    (setq f (open fname "w"))
+    (write-line "fld_sel : dialog { label = \"내보낼 필드(속성) 선택\";" f)
+    (write-line " : text { label = \"헤더 선택: 그룹 전체 포함 / 더블클릭: 상세 필드 확장\"; }" f)
+    (write-line " : list_box { key = \"fldlist\"; multiple_select = true; width = 70; height = 30; }" f)
+    (write-line " : button { label = \"선택 항목 확장/축소 (Toggle Expansion)\"; key = \"btn_toggle\"; }" f)
+    (write-line " ok_cancel; }" f)
+    (close f)
+    
+    (setq expanded_headers '())
+    (setq selected_indices "")
+    (setq loop_res 2) ; Initialize to toggle mode
+
+    (while (= loop_res 2)
+      (setq dcl_id (load_dialog fname))
+      (if (not (new_dialog "fld_sel" dcl_id)) (exit))
+      
+      ;; Build Tree View Strings
+      (setq disp_list '() data_list '())
+      (foreach grp group-list
+        (setq h_name (car grp) flds (cdr grp))
+        (if (member h_name expanded_headers)
+          (progn
+            (setq disp_list (append disp_list (list (strcat "[-] " h_name))))
+            (setq data_list (append data_list (list (cons "HEAD" grp))))
+            (foreach f flds
+              (setq d_name f)
+              (while (vl-string-search ":" d_name) (setq d_name (substr d_name (+ 2 (vl-string-search ":" d_name)))))
+              (setq disp_list (append disp_list (list (strcat "    " d_name))))
+              (setq data_list (append data_list (list (cons "ITEM" f))))
+            )
+          )
+          (progn
+            (setq disp_list (append disp_list (list (strcat "[+] " h_name))))
+            (setq data_list (append data_list (list (cons "HEAD" grp))))
+          )
+        )
+      )
+      
+      (start_list "fldlist") (mapcar 'add_list disp_list) (end_list)
+      (set_tile "fldlist" selected_indices)
+
+      (action_tile "fldlist" 
+        "(setq selected_indices $value)
+         (setq last_clicked_idx (car (read (strcat \"(\" $value \")\"))))
+         (if (= $reason 4) (done_dialog 2))"
+      )
+      (action_tile "btn_toggle" "(done_dialog 2)")
+      (action_tile "accept" "(done_dialog 1)")
+      (action_tile "cancel" "(done_dialog 0)")
+      
+      (setq loop_res (start_dialog))
+      (unload_dialog dcl_id)
+
+      (if (= loop_res 2)
+        (progn
+          (setq target (nth last_clicked_idx data_list))
+          (if (and target (= (car target) "HEAD"))
+            (progn
+              (setq h_name (cadr target))
+              (if (member h_name expanded_headers)
+                (setq expanded_headers (vl-remove h_name expanded_headers))
+                (setq expanded_headers (cons h_name expanded_headers))
+              )
+            )
+          )
+          (setq selected_indices "") 
+        )
+      )
+    )
+    
+    (vl-file-delete fname)
+    (if (= loop_res 1)
+      (progn
+        (setq result '())
+        (foreach idx (read (strcat "(" selected_indices ")"))
+          (setq item (nth idx data_list))
+          (if (= (car item) "HEAD")
+            (foreach f (cddr item) (if (not (member f result)) (setq result (cons f result))))
+            (if (not (member (cdr item) result)) (setq result (cons (cdr item) result)))
+          )
+        )
+        (reverse result)
+      )
+      nil
+    )
+  )
+
+  ;; 1. Select Objects
+  (prompt "\nJSON으로 추출할 객체를 선택하세요 (속성 분석 포함): ")
+  (setq ss (ssget))
+  
+  (if ss
+    (progn
+      ;; 2. Analyze Fields into Groups
+      (setq group_data '())
+      
+      ;; Group 1: Basic Properties (Rotation Removed)
+      (setq sys_flds '("SYS:HANDLE" "SYS:LAYER" "SYS:BLOCK_NAME" "SYS:TEXT" "SYS:X" "SYS:Y" "SYS:WKT"))
+      (setq group_data (cons (cons "BASIC PROPERTIES (기본 속성)" sys_flds) group_data))
+
+      ;; [개선] 선택된 객체들에 실제로 붙어있는 OD 테이블만 분석하여 노출
+      (if (and ade_odtablelist (ade_odtablelist))
+        (progn
+          (setq used_tables '() i_tmp 0)
+          (repeat (sslength ss)
+            (setq en_tmp (ssname ss i_tmp))
+            (foreach tbl (ade_odtablelist)
+              (if (and (not (member tbl used_tables)) (> (ade_odrecordqty en_tmp tbl) 0))
+                (setq used_tables (cons tbl used_tables))
+              )
+            )
+            (setq i_tmp (1+ i_tmp))
+          )
+          (foreach tbl (vl-sort used_tables '<)
+            (setq f_list (mapcar '(lambda (x) (strcat "OD:" tbl ":" (cdr (assoc "ColName" x)))) 
+                                 (cdr (assoc "Columns" (ade_odtabledefn tbl)))))
+            (setq group_data (append group_data (list (cons (strcat "OD TABLE: " tbl) (acad_strlsort f_list)))))
+          )
+        )
+      )
+      
+      (setq sel_flds (select-fields-dialog group_data))
+      (if (null sel_flds) (progn (princ "\n추출이 취소되었습니다.") (exit)))
+
+      ;; 2. 저장 위치 및 파일명 사용자 지정 (getfiled 사용)
+      (setq fname (getfiled "GeoJSON 파일 저장 위치 및 이름 선택" "" "geojson" 1))
+      
+      (if (null fname) (progn (princ "\n파일 저장이 취소되었습니다.") (exit)))
+
+      (setq f (open fname "w"))
+      
+      (write-line "{ \"type\": \"FeatureCollection\", \"features\": [" f)
+      
+      (setq i 0)
+      (setq len (sslength ss))
+      
+      (while (< i len)
+        (setq en (ssname ss i))
+        (setq ent (entget en))
+        (setq type (cdr (assoc 0 ent)))
+        (setq handle (cdr (assoc 5 ent)))
+        (setq layer (escape-json (cdr (assoc 8 ent))))
+        
+        ;; Default Values
+        (setq block "null" text "null" x "null" y "null" rot "0.00" geom "null" wkt_val "null")
+        
+        ;; Coordinates & Rotation
+        (setq pt nil)
+        (if (assoc 10 ent)
+          (setq pt (cdr (assoc 10 ent)))
+        )
+        
+        ;; Alignment Info (72: Horizontal, 73: Vertical)
+        (setq align_h 0)
+        (setq align_v 0)
+        (if (assoc 72 ent) (setq align_h (cdr (assoc 72 ent))))
+        (if (assoc 73 ent) (setq align_v (cdr (assoc 73 ent))))
+        
+        (if pt
+          (progn
+            (setq x (rtos (car pt) 2 16))
+            (setq y (rtos (cadr pt) 2 16))
+          )
+        )
+
+        (if (assoc 50 ent)
+          (setq rot (rtos (* (cdr (assoc 50 ent)) (/ 180.0 pi)) 2 16)) ; Radian to Degree
+        )
+        
+        ;; Type specific handling
+        (cond
+          ((= type "INSERT")
+           (setq block (strcat "\"" (escape-json (cdr (assoc 2 ent))) "\""))
+           (setq geom (strcat "{\"type\": \"Point\", \"coordinates\": [" x ", " y "]}"))
+           (setq wkt_val (strcat "POINT(" x " " y ")"))
+          )
+          ((or (= type "TEXT") (= type "MTEXT"))
+           (setq text (strcat "\"" (escape-json (cdr (assoc 1 ent))) "\""))
+           (setq geom (strcat "{\"type\": \"Point\", \"coordinates\": [" x ", " y "]}"))
+           (setq wkt_val (strcat "POINT(" x " " y ")"))
+          )
+          ((= type "POINT")
+           (setq geom (strcat "{\"type\": \"Point\", \"coordinates\": [" x ", " y "]}"))
+           (setq wkt_val (strcat "POINT(" x " " y ")"))
+          )
+          ((= type "CIRCLE")
+           (setq geom (strcat "{\"type\": \"Point\", \"coordinates\": [" x ", " y "]}"))
+           (setq wkt_val (strcat "POINT(" x " " y ")"))
+          )
+          ((= type "LINE")
+           (setq p1 (cdr (assoc 10 ent)))
+           (setq p2 (cdr (assoc 11 ent)))
+           (setq geom (strcat "{\"type\": \"LineString\", \"coordinates\": [[" (rtos (car p1) 2 16) ", " (rtos (cadr p1) 2 16) "], [" (rtos (car p2) 2 16) ", " (rtos (cadr p2) 2 16) "]]}"))
+           (setq wkt_val (strcat "LINESTRING(" (rtos (car p1) 2 16) " " (rtos (cadr p1) 2 16) ", " (rtos (car p2) 2 16) " " (rtos (cadr p2) 2 16) ")"))
+          )
+          ((= type "LWPOLYLINE")
+           ;; Extract vertices
+           (setq pts "" wkt_pts "")
+           (foreach item ent
+             (if (= (car item) 10)
+               (progn
+                 (setq pts (strcat pts "[" (rtos (cadr item) 2 16) ", " (rtos (caddr item) 2 16) "], "))
+                 (setq wkt_pts (strcat wkt_pts (rtos (cadr item) 2 16) " " (rtos (caddr item) 2 16) ", "))
+               )
+             )
+           )
+           (if (> (strlen pts) 2)
+             (setq pts (substr pts 1 (- (strlen pts) 2))) ; Remove last comma
+           )
+           (if (> (strlen wkt_pts) 2)
+             (setq wkt_val (strcat "LINESTRING(" (substr wkt_pts 1 (- (strlen wkt_pts) 2)) ")"))
+           )
+           (setq geom (strcat "{\"type\": \"LineString\", \"coordinates\": [" pts "]}"))
+          )
+        )
+        
+        ;; Construct JSON Object (Only if geom is valid)
+        (if (and (/= geom "null") sel_flds)
+          (progn
+             (setq json_str "    { \"type\": \"Feature\", \"geometry\": ")
+             (setq json_str (strcat json_str geom ", \"properties\": { "))
+             (setq first_item t)
+             
+             (foreach fld sel_flds
+                (setq val nil f_key nil)
+                (cond
+                   ((= fld "SYS:HANDLE") (setq f_key "HANDLE" val (strcat "\"" handle "\"")))
+                   ((= fld "SYS:LAYER") (setq f_key "LAYER" val (strcat "\"" layer "\"")))
+                   ((= fld "SYS:BLOCK_NAME") (setq f_key "BLOCK_NAME" val block))
+                   ((= fld "SYS:TEXT") (setq f_key "TEXT" val text))
+                   ((= fld "SYS:X") (setq f_key "X" val x))
+                   ((= fld "SYS:Y") (setq f_key "Y" val y))
+                   ((= fld "SYS:ROTATION") (setq f_key "ROTATION" val rot))
+                   ((= fld "SYS:WKT") (setq f_key "WKT" val (if (= wkt_val "null") "null" (strcat "\"" wkt_val "\""))))
+                   ((= (substr fld 1 3) "OD:")
+                      (setq sub (substr fld 4))
+                      (setq pos (vl-string-search ":" sub))
+                      (setq target_tbl (substr sub 1 pos))
+                      (setq target_fld (substr sub (+ pos 2)))
+                      (setq f_key target_fld)
+
+                      (if (and ade_odgetfield (member (strcase target_tbl) (mapcar 'strcase (ade_odtablelist))))
+                         (if (> (ade_odrecordqty en target_tbl) 0)
+                            (setq val (strcat "\"" (escape-json (vl-princ-to-string (ade_odgetfield en target_tbl target_fld 0))) "\""))
+                         )
+                      )
+                   )
+                )
+                
+                (if (and f_key val)
+                   (progn
+                      (if (not first_item) (setq json_str (strcat json_str ", ")))
+                      (setq json_str (strcat json_str "\"" f_key "\": " val)) ; f_key는 이미 대문자 처리되어 있을 수 있으므로 strcase 제거
+                      (setq first_item nil)
+                   )
+                )
+             )
+             
+             (setq json_str (strcat json_str " } }"))
+
+             ;; Add comma if not last
+             (if (< i (1- len))
+               (setq json_str (strcat json_str ","))
+             )
+             (write-line json_str f)
+          )
+        )
+        
+        (setq i (1+ i))
+      )
+      
+      (write-line "]}" f)
+      (close f)
+      
+      ;; [한글 깨짐 방지] 생성된 ANSI 파일을 UTF-8(No BOM)으로 변환
+      ;; PowerShell을 호출하여 QGIS 표준 인코딩으로 변환합니다.
+      (startapp "powershell.exe" 
+        (strcat "-WindowStyle Hidden -Command \"$content = Get-Content -Path '" fname "' -Encoding Default; [System.IO.File]::WriteAllLines('" fname "', $content, (New-Object System.Text.UTF8Encoding($false)))\""))
+      
+      (princ (strcat "\n[성공] QGIS용 GeoJSON 생성됨: " fname))
+      (princ "\n[안내] PowerShell을 통해 UTF-8 인코딩 변환이 완료되었습니다.")
+    )
+    (princ "\n선택된 객체가 없습니다.")
+  )
+  (princ)
+)
+(princ "\n명령어 안내: ODB(객체 DXF), LDB(레이어 DXF), CJ(JSON 추출)")

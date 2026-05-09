@@ -1,0 +1,369 @@
+(vl-load-com)
+
+;;; ==========================================================================
+;;; [MHOD_KR] 하수맨홀 속성 관리 및 데이터 동기화 시스템
+;;; 지원 환경: AutoCAD Map 3D 2000 이상
+;;;
+;;; [명령어 가이드]
+;;; 1. MHD (Manhole OD) : 맨홀 속성 입력 및 텍스트 생성 (중첩 방지 포함)
+;;; 2. MHU (Manhole Update) : 특성창에서 수정한 OD 데이터를 텍스트에 일괄 반영
+;;; 3. MHC (Manhole Check) : OD 데이터와 도면 텍스트의 일치 여부 전수 검사
+;;; 4. MHM (Manhole Missing) : 속성이 입력되지 않은 누락 맨홀 탐색
+;;; ==========================================================================
+
+;; XData 애플리케이션 등록
+(if (not (tblsearch "APPID" "MH_LINK")) (regapp "MH_LINK"))
+
+;; --- 전역 변수: 입력값 유지용 ---
+(if (not *hsm_settings*)
+  (setq *hsm_settings*
+    (list
+      '("id_num"  . "1001")
+      '("sulchi"  . "2026")
+      '("yongdo"  . "0")
+      '("sub_purp" . "0")
+      '("m_form"  . "1")
+      '("m_dia"   . "900")
+      '("m_width" . "900")
+      '("m_length". "900")
+      '("m_height". "1.50")
+      '("m_step"  . "0.00")
+      '("c_form"  . "0")
+      '("c_dia"   . "648")
+      '("c_width" . "")
+      '("c_length". "")
+      '("c_thick" . "0")
+      '("c_mat"   . "0")
+      '("inv_yn"  . "1")
+      '("lad_yn"  . "1")
+      '("fall_yn" . "1")
+      '("status"  . "정상")
+      '("txt_ht"  . "0.3")
+      '("txt_st"  . "ghs")
+    )
+  )
+)
+
+;; --- 설정값 헬퍼 ---
+(defun hsm:get_val (k / val)
+  (setq val (cdr (assoc k *hsm_settings*)))
+  (if (null val) "" (vl-princ-to-string val))
+)
+
+(defun hsm:set_val (k v) (setq *hsm_settings* (subst (cons k v) (assoc k *hsm_settings*) *hsm_settings*)))
+
+;; --- Object Data 테이블 정의 ---
+(defun hsm:check_table (/ tableName tableDef)
+  (setq tableName "HSM_DATA")
+  (if (null ade_odtablelist)
+    (progn (alert "오류: Autodesk Map 기능이 로드되지 않았습니다.") nil)
+    (if (member (strcase tableName) (mapcar 'strcase (ade_odtablelist)))
+      t
+      (progn
+        (princ (strcat "\n[" tableName "] 테이블 생성 중..."))
+        (setq tableDef 
+          (list (cons "TableName" tableName) (cons "TableDesc" "하수맨홀 데이터")
+            (cons "Columns" (list
+              (list (cons "ColName" "ORG_ID")   (cons "ColDesc" "관리번호") (cons "ColType" "Character") (cons "DefaultVal" ""))
+              (list (cons "ColName" "PURP")     (cons "ColDesc" "용도")     (cons "ColType" "Character") (cons "DefaultVal" ""))
+              (list (cons "ColName" "YEAR")     (cons "ColDesc" "설치연도") (cons "ColType" "Character") (cons "DefaultVal" "2026"))
+              (list (cons "ColName" "FORM")     (cons "ColDesc" "형태")     (cons "ColType" "Character") (cons "DefaultVal" ""))
+              (list (cons "ColName" "MAT_COV")  (cons "ColDesc" "뚜껑재질") (cons "ColType" "Character") (cons "DefaultVal" ""))
+              (list (cons "ColName" "C_FORM")   (cons "ColDesc" "뚜껑형태") (cons "ColType" "Character") (cons "DefaultVal" ""))
+              (list (cons "ColName" "C_DIA")    (cons "ColDesc" "뚜껑구경") (cons "ColType" "Real")      (cons "DefaultVal" 0.0))
+              (list (cons "ColName" "C_WIDTH")  (cons "ColDesc" "뚜껑가로") (cons "ColType" "Real")      (cons "DefaultVal" 0.0))
+              (list (cons "ColName" "C_LENGTH") (cons "ColDesc" "뚜껑세로") (cons "ColType" "Real")      (cons "DefaultVal" 0.0))
+              (list (cons "ColName" "C_THICK")  (cons "ColDesc" "뚜껑두께") (cons "ColType" "Real")      (cons "DefaultVal" 0.0))
+              (list (cons "ColName" "INV_YN")   (cons "ColDesc" "인버터")   (cons "ColType" "Character") (cons "DefaultVal" ""))
+              (list (cons "ColName" "LAD_YN")   (cons "ColDesc" "사다리")   (cons "ColType" "Character") (cons "DefaultVal" ""))
+              (list (cons "ColName" "FALL_YN")  (cons "ColDesc" "추락방지") (cons "ColType" "Character") (cons "DefaultVal" ""))
+              (list (cons "ColName" "M_DIA")    (cons "ColDesc" "본체내경") (cons "ColType" "Real")      (cons "DefaultVal" 0.0))
+              (list (cons "ColName" "M_WIDTH")  (cons "ColDesc" "본체가로") (cons "ColType" "Real")      (cons "DefaultVal" 0.0))
+              (list (cons "ColName" "M_LENGTH") (cons "ColDesc" "본체세로") (cons "ColType" "Real")      (cons "DefaultVal" 0.0))
+              (list (cons "ColName" "HEIGHT")   (cons "ColDesc" "총 높이")   (cons "ColType" "Real")      (cons "DefaultVal" 0.0))
+              (list (cons "ColName" "STEP_H")   (cons "ColDesc" "턱 높이")   (cons "ColType" "Real")      (cons "DefaultVal" 0.0))
+              (list (cons "ColName" "STATUS")   (cons "ColDesc" "이상상태") (cons "ColType" "Character") (cons "DefaultVal" ""))
+              (list (cons "ColName" "SPEC")     (cons "ColDesc" "전체제원") (cons "ColType" "Character") (cons "DefaultVal" ""))
+            ))
+          )
+        )
+        (if (ade_oddefinetab tableDef)
+          (progn (princ " 완료.") t)
+          (progn (alert "테이블 생성 실패!") nil)
+        )
+      )
+    )
+  )
+)
+
+;; --- 제원 문자열 재생성 ---
+(defun hsm:get-jewon-string (en / _f)
+  (defun _f (f p / v) 
+    (setq v (ade_odgetfield en "HSM_DATA" f 0))
+    (cond 
+      ((numberp v) (if (equal v 0.0 0.001) "" (rtos v 2 p)))
+      ((null v) "")
+      (t (vl-princ-to-string v))
+    )
+  )
+  (strcat 
+    (_f "ORG_ID" 0) "/"    ; 1. 관리번호
+    (_f "PURP" 0) "/"      ; 2. 용도
+    (_f "FORM" 0) "/"      ; 3. 본체형태
+    (_f "C_DIA" 0) "/"     ; 4. 뚜껑구경
+    (_f "C_WIDTH" 0) "/"   ; 5. 뚜껑가로
+    (_f "C_LENGTH" 0) "/"  ; 6. 뚜껑세로
+    (_f "MAT_COV" 0) "/"   ; 8. 뚜껑재질
+    (_f "INV_YN" 0) "/"    ; 9. 인버터
+    (_f "LAD_YN" 0) "/"    ; 10. 사다리
+    (_f "FALL_YN" 0) "/"   ; 11. 추락방지
+    (_f "STATUS" 0) "/"    ; 12. 이상상태
+    "%%d" "/"              ; 11. 고정기호
+    "H:" (_f "HEIGHT" 2) "/" ; 12. 총높이
+    "T:" (_f "STEP_H" 2) "/" ; 13. 턱높이
+    "뚜껑" "/"             ; 14. 고정문자
+    (_f "C_FORM" 0) "/"    ; 15. 뚜껑형태
+    (_f "M_DIA" 0) "/"     ; 16. 본체내경
+    (_f "C_THICK" 0) "/"   ; 19. 뚜껑두께 (이동됨)
+    (_f "M_WIDTH" 0) "/"   ; 17. 본체가로
+    (_f "M_LENGTH" 0)      ; 18. 본체세로
+  )
+)
+
+;; --- 객체 링크 및 OD 기록 ---
+(defun hsm:link-entities (target_en text_en / xdata)
+  (setq xdata (list (list -3 (list "MH_LINK" (cons 1005 (cdr (assoc 5 (entget text_en))))))))
+  (entmod (append (entget target_en) xdata))
+  (setq xdata (list (list -3 (list "MH_LINK" (cons 1005 (cdr (assoc 5 (entget target_en))))))))
+  (entmod (append (entget text_en) xdata))
+)
+
+(defun hsm:attach_od (en m_id yongdo_txt year m_form_txt c_form_txt c_dia c_w c_l c_thick c_mat_txt inv_txt lad_txt fall_txt m_dia m_w m_l m_h m_t status_txt total_txt)
+  (if (and ade_odrecordqty (hsm:check_table))
+    (progn
+      (if (= (ade_odrecordqty en "HSM_DATA") 0) (ade_odaddrecord en "HSM_DATA"))
+      (ade_odsetfield en "HSM_DATA" "ORG_ID"   0 m_id)
+      (ade_odsetfield en "HSM_DATA" "PURP"     0 yongdo_txt)
+      (ade_odsetfield en "HSM_DATA" "YEAR"     0 year)
+      (ade_odsetfield en "HSM_DATA" "FORM"     0 m_form_txt)
+      (ade_odsetfield en "HSM_DATA" "C_FORM"   0 c_form_txt)
+      (ade_odsetfield en "HSM_DATA" "C_DIA"    0 (atof c_dia))
+      (ade_odsetfield en "HSM_DATA" "C_WIDTH"  0 (atof c_w))
+      (ade_odsetfield en "HSM_DATA" "C_LENGTH" 0 (atof c_l))
+      (ade_odsetfield en "HSM_DATA" "C_THICK"  0 (atof c_thick))
+      (ade_odsetfield en "HSM_DATA" "MAT_COV"  0 c_mat_txt)
+      (ade_odsetfield en "HSM_DATA" "INV_YN"   0 inv_txt)
+      (ade_odsetfield en "HSM_DATA" "LAD_YN"   0 lad_txt)
+      (ade_odsetfield en "HSM_DATA" "FALL_YN"  0 fall_txt)
+      (ade_odsetfield en "HSM_DATA" "M_DIA"    0 (atof m_dia))
+      (ade_odsetfield en "HSM_DATA" "M_WIDTH"  0 (atof m_w))
+      (ade_odsetfield en "HSM_DATA" "M_LENGTH" 0 (atof m_l))
+      (ade_odsetfield en "HSM_DATA" "HEIGHT"   0 (atof m_h))
+      (ade_odsetfield en "HSM_DATA" "STEP_H"   0 (atof m_t))
+      (ade_odsetfield en "HSM_DATA" "STATUS"   0 status_txt)
+      (ade_odsetfield en "HSM_DATA" "SPEC"     0 total_txt)
+      (entupd en)
+    )
+  )
+)
+
+;; --- 명령어: MHD (Entry) ---
+(defun c:MHD (/ dclpath f dcl_id dlg_res s_data s_list m_id year_val yongdo_idx sub_idx m_form_idx m_dia m_w m_l m_h m_t c_form_idx c_dia c_w c_l c_thick c_mat_idx inv_idx lad_idx fall_idx status yongdo_txt m_form_txt c_form_txt c_mat_txt inv_txt lad_txt fall_txt total_txt old_layer old_style old_osmode text_ent exist_id_qty old_txt_h old_txt_en txt_ht_val txt_st_val)
+  (if (null (hsm:check_table)) (exit))
+  (setq old_layer (getvar "clayer") old_style (getvar "textstyle") old_osmode (getvar "osmode"))
+  (setq s_data (car (entsel "\n[HSM] 속성을 입력할 맨홀 객체를 선택하세요: ")))
+  (if (null s_data) (exit))
+  (setq s_list (entget s_data))
+
+  (setq dclpath (strcat (getenv "TEMP") "\\hsm_mhd.dcl"))
+  (setq f (open dclpath "w"))
+  (write-line "hsm_mhd : dialog { label = \"맨홀 속성 상세 입력 (MHD)\"; width = 60;" f)
+  (write-line " : edit_box { label = \"맨홀관리번호\"; key = \"id_num\"; edit_width = 25; }" f)
+  (write-line " : edit_box { label = \"설치연도\"; key = \"sulchi\"; edit_width = 15; }" f)
+  (write-line " : boxed_radio_row { label = \"용도\";" f)
+  (write-line "  : radio_button { label = \"우수\"; key = \"y0\"; }" f)
+  (write-line "  : radio_button { label = \"오수\"; key = \"y1\"; }" f)
+  (write-line "  : radio_button { label = \"합류\"; key = \"y2\"; }" f)
+  (write-line "  : radio_button { label = \"차집\"; key = \"y3\"; }" f)
+  (write-line "  : radio_button { label = \"상수\"; key = \"y4\"; }" f)
+  (write-line " }" f)
+  (write-line " : boxed_row { label = \"상수 세부용도\"; key = \"sub_purp_box\";" f)
+  (write-line "  : radio_button { label = \"배기변\"; key = \"sy0\"; }" f)
+  (write-line "  : radio_button { label = \"점검구\"; key = \"sy1\"; }" f)
+  (write-line "  : radio_button { label = \"소화전\"; key = \"sy2\"; }" f)
+  (write-line " }" f)
+  (write-line " : row {" f)
+  (write-line "  : boxed_column { label = \"맨홀 본체 형태\";" f)
+  (write-line "   : radio_button { label = \"원형\"; key = \"mf0\"; } : radio_button { label = \"각형\"; key = \"mf1\"; } : radio_button { label = \"구거형\"; key = \"mf2\"; } }" f)
+  (write-line "  : boxed_column { label = \"본체 규격 (mm)\";" f)
+  (write-line "   : edit_box { label = \"내경\"; key = \"m_dia\"; } : edit_box { label = \"가로\"; key = \"m_w\"; } : edit_box { label = \"세로\"; key = \"m_l\"; } } }" f)
+  (write-line " : row {" f)
+  (write-line "  : edit_box { label = \"총 높이(H)\"; key = \"m_h\"; } : edit_box { label = \"턱 높이(T)\"; key = \"m_t\"; } }" f)
+  (write-line " : boxed_row { label = \"뚜껑(Cover) 정보\";" f)
+  (write-line "  : column { : radio_button { label = \"원형\"; key = \"cf0\"; } : radio_button { label = \"각형\"; key = \"cf1\"; } }" f)
+  (write-line "  : column { : edit_box { label = \"구경\"; key = \"c_dia\"; } : edit_box { label = \"가로\"; key = \"c_w\"; } : edit_box { label = \"세로\"; key = \"c_l\"; } : edit_box { label = \"두께\"; key = \"c_thick\"; } }" f)
+  (write-line "  : popup_list { label = \"재질\"; key = \"c_mat\"; width = 12; } }" f)
+  (write-line " : row {" f)
+  (write-line "  : boxed_column { label = \"부대시설\";" f)
+  (write-line "    : row { : text { label = \"인버터  \"; width = 8; } : radio_button { label=\"유\"; key=\"i0\"; } : radio_button { label=\"무\"; key=\"i1\"; } }" f)
+  (write-line "    : row { : text { label = \"사다리  \"; width = 8; } : radio_button { label=\"유\"; key=\"l0\"; } : radio_button { label=\"무\"; key=\"l1\"; } }" f)
+  (write-line "    : row { : text { label = \"추락방지\"; width = 8; } : radio_button { label=\"유\"; key=\"fa0\"; } : radio_button { label=\"무\"; key=\"fa1\"; } } }" f)
+  (write-line "  : column { : edit_box { label = \"이상상태\"; key = \"status\"; } }" f)
+  (write-line "  : column { : edit_box { label = \"글자높이\"; key = \"txt_ht\"; } " f)
+  (write-line "             : edit_box { label = \"스타일\"; key = \"txt_st\"; edit_width = 12; } }" f)
+  (write-line " } ok_cancel; }" f)
+  (close f)
+
+  (setq dcl_id (load_dialog dclpath))
+  (if (not (new_dialog "hsm_mhd" dcl_id)) (exit))
+
+  (setq exist_id_qty (if (member (strcase "HSM_DATA") (mapcar 'strcase (ade_odtablelist))) (ade_odrecordqty s_data "HSM_DATA") 0))
+  (if (> exist_id_qty 0)
+    (set_tile "id_num" (vl-princ-to-string (ade_odgetfield s_data "HSM_DATA" "ORG_ID" 0)))
+    (set_tile "id_num" (strcat "MH" (hsm:get_val "id_num")))
+  )
+  (set_tile "sulchi" (hsm:get_val "sulchi"))
+  (set_tile (strcat "y" (hsm:get_val "yongdo")) "1")
+  (set_tile (strcat "sy" (hsm:get_val "sub_purp")) "1")
+  (set_tile (strcat "mf" (hsm:get_val "m_form")) "1")
+  (set_tile "m_dia" (hsm:get_val "m_dia")) (set_tile "m_w" (hsm:get_val "m_width")) (set_tile "m_l" (hsm:get_val "m_length"))
+  (set_tile "m_h" (hsm:get_val "m_height")) (set_tile "m_t" (hsm:get_val "m_step"))
+  (set_tile (strcat "cf" (hsm:get_val "c_form")) "1")
+  (set_tile "c_dia" (hsm:get_val "c_dia")) (set_tile "c_w" (hsm:get_val "c_width")) (set_tile "c_l" (hsm:get_val "c_length"))
+  (set_tile "c_thick" (hsm:get_val "c_thick"))
+  (set_tile "status" (hsm:get_val "status"))
+  (set_tile (strcat "i" (hsm:get_val "inv_yn")) "1")
+  (set_tile (strcat "l" (hsm:get_val "lad_yn")) "1")
+  (set_tile (strcat "fa" (hsm:get_val "fall_yn")) "1")
+  (set_tile "txt_ht" (hsm:get_val "txt_ht"))
+  (set_tile "txt_st" (hsm:get_val "txt_st"))
+  
+  (start_list "c_mat") (mapcar 'add_list '("주철" "칼라콘크리트" "콘크리트" "SG" "철판" "기타")) (end_list)
+  (set_tile "c_mat" (hsm:get_val "c_mat"))
+
+  (defun update_ui ()
+    (mode_tile "m_dia" (if (= (get_tile "mf0") "1") 0 1))
+    (mode_tile "m_w" (if (= (get_tile "mf1") "1") 0 1))
+    (mode_tile "m_l" (if (= (get_tile "mf1") "1") 0 1))
+    (mode_tile "c_dia" (if (= (get_tile "cf0") "1") 0 1))
+    (mode_tile "c_w" (if (= (get_tile "cf1") "1") 0 1))
+    (mode_tile "c_l" (if (= (get_tile "cf1") "1") 0 1))
+    (mode_tile "sub_purp_box" (if (= (get_tile "y4") "1") 0 1))
+  )
+  (mapcar '(lambda (k) (action_tile k "(update_ui)")) '("mf0" "mf1" "mf2" "cf0" "cf1" "y0" "y1" "y2" "y3" "y4"))
+  (update_ui)
+
+  (action_tile "accept" (strcat 
+    "(setq m_id (get_tile \"id_num\") year_val (get_tile \"sulchi\"))"
+    "(setq yongdo_idx (cond ((= (get_tile \"y0\") \"1\") \"0\") ((= (get_tile \"y1\") \"1\") \"1\") ((= (get_tile \"y2\") \"1\") \"2\") ((= (get_tile \"y3\") \"1\") \"3\") (t \"4\")))"
+    "(setq sub_idx (cond ((= (get_tile \"sy0\") \"1\") \"0\") ((= (get_tile \"sy1\") \"1\") \"1\") (t \"2\")))"
+    "(setq m_form_idx (cond ((= (get_tile \"mf0\") \"1\") \"0\") ((= (get_tile \"mf1\") \"1\") \"1\") (t \"2\")))"
+    "(setq m_dia (get_tile \"m_dia\") m_w (get_tile \"m_w\") m_l (get_tile \"m_l\") m_h (get_tile \"m_h\") m_t (get_tile \"m_t\"))"
+    "(setq c_form_idx (if (= (get_tile \"cf0\") \"1\") \"0\" \"1\"))"
+    "(setq c_dia (get_tile \"c_dia\") c_w (get_tile \"c_w\") c_l (get_tile \"c_l\") c_thick (get_tile \"c_thick\") c_mat_idx (get_tile \"c_mat\"))"
+    "(setq inv_idx (if (= (get_tile \"i0\") \"1\") \"0\" \"1\") lad_idx (if (= (get_tile \"l0\") \"1\") \"0\" \"1\") fall_idx (if (= (get_tile \"fa0\") \"1\") \"0\" \"1\") status (get_tile \"status\"))"
+    "(setq txt_ht_val (get_tile \"txt_ht\")) (setq txt_st_val (get_tile \"txt_st\")) (done_dialog 1)"))
+  
+  (setq dlg_res (start_dialog)) (unload_dialog dcl_id) (vl-file-delete dclpath)
+
+  (if (= dlg_res 1)
+    (progn
+      (if (> exist_id_qty 0) (setq m_id (ade_odgetfield s_data "HSM_DATA" "ORG_ID" 0))
+        (progn
+          (setq i 1 found nil) (while (and (<= i (strlen m_id)) (not found)) (if (wcmatch (substr m_id i 1) "#") (setq found i) (setq i (1+ i))))
+          (if found (hsm:set_val "id_num" (itoa (1+ (atoi (substr m_id found))))))
+          (if (not (wcmatch (strcase m_id) "MH*")) (setq m_id (strcat "MH" m_id)))
+        )
+      )
+      (hsm:set_val "yongdo" yongdo_idx) (hsm:set_val "m_form" m_form_idx) (hsm:set_val "m_dia" m_dia) (hsm:set_val "m_width" m_w) (hsm:set_val "m_length" m_l)
+      (hsm:set_val "m_height" m_h) (hsm:set_val "m_step" m_t) (hsm:set_val "c_form" c_form_idx) (hsm:set_val "c_dia" c_dia) (hsm:set_val "c_width" c_w) (hsm:set_val "c_length" c_l)
+      (hsm:set_val "c_thick" c_thick) (hsm:set_val "c_mat" c_mat_idx) (hsm:set_val "inv_yn" inv_idx) (hsm:set_val "lad_yn" lad_idx) (hsm:set_val "fall_yn" fall_idx)
+      (hsm:set_val "status" status) (hsm:set_val "txt_ht" txt_ht_val) (hsm:set_val "txt_st" txt_st_val)
+      (if (and txt_st_val (/= txt_st_val "")) (setvar "TEXTSTYLE" txt_st_val))
+
+      (cond ((= m_form_idx "0") (setq m_w "" m_l "")) ((= m_form_idx "1") (setq m_dia "")) (t (setq m_dia "" m_w "" m_l "")))
+      (if (= c_form_idx "0") (setq c_w "" c_l "") (setq c_dia ""))
+
+      (setq yongdo_txt (nth (atoi yongdo_idx) '("우수" "오수" "합류" "차집" "상수")))
+      (if (= yongdo_idx "4")
+        (setq yongdo_txt (strcat "상수(" (nth (atoi sub_idx) '("배기변" "점검구" "소화전")) ")"))
+      )
+
+      (setq m_form_txt (nth (atoi m_form_idx) '("원형" "각형" "구거형"))
+            c_form_txt (if (= c_form_idx "0") "원형" "각형")
+            c_mat_txt  (nth (atoi c_mat_idx) '("주철" "칼라콘크리트" "콘크리트" "SG" "철판" "기타"))
+            inv_txt    (if (= inv_idx "0") "인유" "인무")
+            lad_txt    (if (= lad_idx "0") "사유" "사무")
+            fall_txt   (if (= fall_idx "0") "추유" "추무"))
+
+      (defun _fmt (v p) (if (or (= v "") (= v "0") (= v "0.0") (= v "0.00")) "" (if (numberp v) (rtos v 2 p) v)))
+
+      (setq total_txt 
+        (strcat 
+          m_id "/" 
+          yongdo_txt "/" 
+          m_form_txt "/" 
+          (_fmt c_dia 0) "/" 
+          (_fmt c_w 0) "/" 
+          (_fmt c_l 0) "/" 
+          c_mat_txt "/" 
+          inv_txt "/" 
+          lad_txt "/" 
+          fall_txt "/" 
+          status "/" 
+          "%%d" "/" 
+          "H:" (_fmt m_h 2) "/" 
+          "T:" (_fmt m_t 2) "/" 
+          "뚜껑" "/" 
+          c_form_txt "/" 
+          (_fmt m_dia 0) "/" 
+          (_fmt c_thick 0) "/" 
+          (_fmt m_w 0) "/" 
+          (_fmt m_l 0)
+        )
+      )
+
+      (setq ent (entget s_data '("MH_LINK")))
+      (if (setq xdata (assoc -3 ent))
+        (progn (setq old_txt_h (cdr (assoc 1005 (cdadr xdata)))) (setq old_txt_en (handent old_txt_h)) (if (and old_txt_en (entget old_txt_en)) (entdel old_txt_en))))
+
+      (if (tblsearch "layer" (strcat (cdr (assoc 8 s_list)) "_속성")) (setvar "clayer" (strcat (cdr (assoc 8 s_list)) "_속성")) (command "layer" "m" (strcat (cdr (assoc 8 s_list)) "_속성") ""))
+      (command "text" (cdr (assoc 10 s_list)) txt_ht_val "0" total_txt)
+      (setq text_ent (entlast))
+      (command "change" s_data "" "p" "c" "9" "")
+      (hsm:attach_od s_data m_id yongdo_txt year_val m_form_txt c_form_txt c_dia c_w c_l c_thick c_mat_txt inv_txt lad_txt fall_txt m_dia m_w m_l m_h m_t status total_txt)
+      (hsm:attach_od text_ent m_id yongdo_txt year_val m_form_txt c_form_txt c_dia c_w c_l c_thick c_mat_txt inv_txt lad_txt fall_txt m_dia m_w m_l m_h m_t status total_txt)
+      (hsm:link-entities s_data text_ent)
+      (setvar "clayer" old_layer) (setvar "textstyle" old_style) (setvar "osmode" old_osmode)
+      (princ "\n[성공] MHD: 입력 및 데이터베이스화 완료.")
+    )
+  )
+  (princ)
+)
+
+;; --- 명령어: MHU (Update) ---
+(defun c:mhu (/ ss i en ent xdata txt_h txt_en new_str)
+  (princ "\n업데이트할 맨홀 블록을 선택하세요 [전체는 Enter]: ")
+  (setq ss (ssget '((0 . "INSERT"))))
+  (if (null ss) (setq ss (ssget "X" '((0 . "INSERT") (-3 ("MH_LINK"))))))
+  (if ss (progn (setq i 0) (repeat (sslength ss) (setq en (ssname ss i)) (setq ent (entget en '("MH_LINK"))) (if (setq xdata (assoc -3 ent)) (progn (setq txt_h (cdr (assoc 1005 (cdadr xdata)))) (setq txt_en (handent txt_h)) (if (and txt_en (setq txt_elist (entget txt_en))) (progn (setq new_str (hsm:get-jewon-string en)) (entmod (subst (cons 1 new_str) (assoc 1 (entget txt_en)) (entget txt_en))) (ade_odsetfield en "HSM_DATA" "SPEC" 0 new_str))))) (setq i (1+ i))) (princ (strcat "\n[성공] " (itoa i) "개의 맨홀 제원 동기화 완료."))))
+  (princ)
+)
+
+;; --- 명령어: MHC (Check) ---
+(defun c:mhc (/ ss i en ent xdata txt_h txt_en od_str txt_str err_count)
+  (setq ss (ssget "X" '((0 . "INSERT") (-3 ("MH_LINK")))))
+  (if ss (progn (if (not (tblsearch "LAYER" "_MH_불일치")) (command "layer" "m" "_MH_불일치" "c" "2" "" "")) (setq i 0 err_count 0) (repeat (sslength ss) (setq en (ssname ss i)) (setq ent (entget en '("MH_LINK"))) (setq xdata (assoc -3 ent)) (setq txt_h (cdr (assoc 1005 (cdadr xdata)))) (setq txt_en (handent txt_h)) (if (and txt_en (setq txt_ent (entget txt_en))) (progn (setq od_str (hsm:get-jewon-string en)) (setq txt_str (cdr (assoc 1 txt_ent))) (if (/= od_str txt_str) (progn (entmake (list (cons 0 "CIRCLE") (cons 8 "_MH_불일치") (cons 62 2) (cons 10 (cdr (assoc 10 (entget en)))) (cons 40 3.0))) (setq err_count (1+ err_count)) (princ (strcat "\n[불일치] " (vl-princ-to-string (ade_odgetfield en "HSM_DATA" "ORG_ID" 0)))))))) (setq i (1+ i))) (if (> err_count 0) (princ (strcat "\n[주의] 총 " (itoa err_count) "개의 불일치 발견.")) (princ "\n[검사 완료] 모든 데이터 일치."))))
+  (princ)
+)
+
+;; --- 명령어: MHM (Missing) ---
+(defun c:mhm (/ ss i en miss_count qty)
+  (princ "\n[누락 검사] 대상 맨홀 블록들을 선택하세요: ")
+  (setq ss (ssget '((0 . "INSERT"))))
+  (if ss (progn (if (not (tblsearch "LAYER" "_MH_미입력")) (command "layer" "m" "_MH_미입력" "c" "2" "" "")) (setq i 0 miss_count 0) (repeat (sslength ss) (setq en (ssname ss i)) (setq qty (if (member (strcase "HSM_DATA") (mapcar 'strcase (ade_odtablelist))) (ade_odrecordqty en "HSM_DATA") 0)) (if (= qty 0) (progn (entmake (list (cons 0 "CIRCLE") (cons 8 "_MH_미입력") (cons 62 2) (cons 10 (cdr (assoc 10 (entget en)))) (cons 40 3.0))) (setq miss_count (1+ miss_count)))) (setq i (1+ i))) (princ (strcat "\n[완료] 총 " (itoa miss_count) "개의 누락 객체 발견."))))
+  (princ)
+)
+
+(princ "\nMHD_KR 로드됨. 명령어: MHD, MHU, MHC, MHM")
+(princ)

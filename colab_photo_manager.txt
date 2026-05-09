@@ -1,0 +1,393 @@
+# @title 1. 환경 설정 및 라이브러리 설치 (실행 후 런타임 재시작 필요 없음)
+!pip install -q supabase boto3 pandas ipywidgets requests Pillow
+
+import os
+import io
+import time
+import json
+import uuid
+import base64
+import datetime
+import requests
+import pandas as pd
+import ipywidgets as widgets
+import mimetypes
+from IPython.display import display, clear_output, Image as IPImage
+from supabase import create_client
+import boto3
+from PIL import Image as PILImage
+from PIL import ImageOps
+
+# ----------------------------------------------------------------------
+# 2. 설정 (서버에서 자동 로드)
+# ----------------------------------------------------------------------
+BASE_URL = "https://script.google.com/macros/s/AKfycbwnV8CS2X_MYs5ZjOeTg7rBexOtjFeumTIcRJ4CWy-qPM4yV-G2pp_jcpyZoESI8cHq/exec"
+
+print("서버에서 설정 정보를 가져오는 중...")
+try:
+    res_supa = requests.get(BASE_URL, params={'action': 'getSupabaseConfig'}).json()
+    SUPABASE_URL = res_supa.get('url', '')
+    SUPABASE_KEY = res_supa.get('key', '')
+
+    res_r2 = requests.get(BASE_URL, params={'action': 'getR2Config'}).json()
+    R2_ENDPOINT = res_r2.get('R2_Endpoints', '')
+    R2_ACCESS_KEY = res_r2.get('R2_Access_Key_ID', '')
+    R2_SECRET_KEY = res_r2.get('R2_Secret_Access_Key', '')
+    R2_BUCKET_NAME = res_r2.get('R2_BUCKET_NAME', '')
+    R2_PUBLIC_URL = res_r2.get('R2_Public_Url', '')
+
+    if not R2_PUBLIC_URL:
+        R2_PUBLIC_URL = "https://pub-64820218d8b845c7860fb4ea3b6d7ec3.r2.dev"
+
+    if SUPABASE_URL and R2_ENDPOINT:
+        print("✅ 설정 로드 성공!")
+    else:
+        print("❌ 설정 로드 실패.")
+except Exception as e:
+    print(f"❌ 설정 로드 중 오류: {e}")
+    SUPABASE_URL = ""
+    SUPABASE_KEY = ""
+    R2_ENDPOINT = ""
+    R2_ACCESS_KEY = ""
+    R2_SECRET_KEY = ""
+    R2_BUCKET_NAME = ""
+    R2_PUBLIC_URL = ""
+
+# ----------------------------------------------------------------------
+# 3. Backend Logic
+# ----------------------------------------------------------------------
+
+def process_image_data(file_name, file_data):
+    """이미지 리사이징 및 포맷 변환"""
+    try:
+        # 데이터 타입 보정 (memoryview -> bytes)
+        data_bytes = file_data
+        if hasattr(file_data, 'tobytes'): data_bytes = file_data.tobytes()
+        elif hasattr(file_data, 'read'): 
+            file_data.seek(0)
+            data_bytes = file_data.read()
+            
+        img = PILImage.open(io.BytesIO(data_bytes))
+        img = ImageOps.exif_transpose(img)
+        max_width = 1024
+        if img.width > max_width:
+            ratio = max_width / img.width
+            new_height = int(img.height * ratio)
+            img = img.resize((max_width, new_height), PILImage.Resampling.LANCZOS)
+        
+        buffer = io.BytesIO()
+        if img.mode in ("RGBA", "P"): img = img.convert("RGB")
+        img.save(buffer, format="JPEG", quality=70)
+        return os.path.splitext(file_name)[0] + ".jpg", "image/jpeg", buffer.getvalue()
+    except Exception as e:
+        print(f"이미지 처리 실패 ({file_name}): {e}, 원본 사용")
+        mime_type, _ = mimetypes.guess_type(file_name)
+        if not mime_type:
+            mime_type = "application/octet-stream"
+        return file_name, mime_type, data_bytes if 'data_bytes' in locals() else file_data
+
+class SupabaseManager:
+    def __init__(self, url, key):
+        self.client = None
+        self.enabled = False
+        if url and key:
+            try:
+                self.client = create_client(url, key)
+                self.enabled = True
+            except Exception as e:
+                print(f"[Supabase] 연결 실패: {e}")
+
+    def get_cad_projects(self):
+        if not self.enabled: return []
+        try:
+            res = self.client.table("cad_projects").select("*").order("created_at", desc=True).execute()
+            return res.data
+        except Exception as e:
+            print(f"[Supabase] 프로젝트 조회 오류: {e}")
+            return []
+
+    def get_files(self, project_id):
+        if not self.enabled: return []
+        try:
+            res = self.client.table("photos").select("*").eq("cad_project_id", project_id).order("created_at", desc=True).execute()
+            return res.data
+        except Exception as e:
+            print(f"[Supabase] 사진 조회 오류: {e}")
+            return []
+
+    def insert_photo(self, project_id, file_name, file_url):
+        if not self.enabled: return None
+        try:
+            file_id = str(uuid.uuid4())
+            data = {
+                "cad_project_id": str(project_id),
+                "file_name": file_name,
+                "file_url": file_url,
+                "file_id": file_id
+            }
+            res = self.client.table("photos").insert(data).execute()
+            if res.data: return res.data[0]
+        except Exception as e:
+            print(f"[Supabase] 사진 등록 오류: {e}")
+        return None
+
+    def delete_photo(self, file_id):
+        if not self.enabled: return False
+        try:
+            self.client.table("photos").delete().eq("file_id", file_id).execute()
+            return True
+        except Exception as e:
+            print(f"[Supabase] 사진 삭제 오류: {e}")
+            return False
+
+class R2Manager:
+    def __init__(self, endpoint, access_key, secret_key, bucket, public_url):
+        self.client = None
+        self.bucket_name = bucket
+        self.public_url = public_url
+        self.enabled = False
+        if endpoint and access_key:
+            try:
+                self.client = boto3.client(
+                    's3',
+                    endpoint_url=endpoint,
+                    aws_access_key_id=access_key,
+                    aws_secret_access_key=secret_key,
+                    region_name='auto'
+                )
+                self.enabled = True
+            except Exception as e:
+                print(f"[R2] 연결 실패: {e}")
+
+    def upload_file(self, file_name, file_data, content_type='application/octet-stream'):
+        if not self.enabled: return False
+        try:
+            self.client.put_object(
+                Bucket=self.bucket_name,
+                Key=file_name,
+                Body=file_data,
+                ContentType=content_type,
+                CacheControl="public, max-age=31536000"
+            )
+            return True
+        except Exception as e:
+            print(f"[R2] 업로드 실패: {e}")
+            return False
+
+    def delete_file(self, file_name):
+        if not self.enabled: return False
+        try:
+            self.client.delete_object(Bucket=self.bucket_name, Key=file_name)
+            return True
+        except Exception as e:
+            print(f"[R2] 삭제 실패: {e}")
+            return False
+
+    def get_object(self, key):
+        if not self.enabled: return None
+        try:
+            response = self.client.get_object(Bucket=self.bucket_name, Key=key)
+            return response['Body'].read()
+        except Exception as e:
+            print(f"[R2] 다운로드 실패: {e}")
+            return None
+
+db = SupabaseManager(SUPABASE_URL, SUPABASE_KEY)
+r2 = R2Manager(R2_ENDPOINT, R2_ACCESS_KEY, R2_SECRET_KEY, R2_BUCKET_NAME, R2_PUBLIC_URL)
+
+# ----------------------------------------------------------------------
+# 4. UI 및 로직
+# ----------------------------------------------------------------------
+
+title_lbl = widgets.HTML("<h2>📸 AsinTech Photo Management (Colab Edition)</h2>")
+
+# 프로젝트 선택
+project_dropdown = widgets.Dropdown(description="프로젝트:", layout=widgets.Layout(width='50%'))
+refresh_btn = widgets.Button(description="새로고침", icon="refresh")
+project_output = widgets.Output()
+
+# 사진 목록 (SelectMultiple 사용)
+photo_list_widget = widgets.SelectMultiple(
+    options=[],
+    description='사진 목록:',
+    disabled=False,
+    layout=widgets.Layout(width='100%', height='300px')
+)
+photo_count_lbl = widgets.Label(value="0개의 사진")
+
+# 미리보기
+preview_output = widgets.Output(layout=widgets.Layout(height='300px', border='1px solid #ddd', overflow='auto'))
+
+# 업로드 (FileUpload)
+upload_widget = widgets.FileUpload(
+    accept='image/*',
+    multiple=True,
+    description='사진 업로드 (파일 선택)'
+)
+upload_container = widgets.VBox([upload_widget])
+upload_output = widgets.Output()
+
+# 삭제
+delete_btn = widgets.Button(description="선택 항목 삭제", button_style='danger', icon='trash')
+
+# --- Logic ---
+
+def load_projects(b=None):
+    with project_output:
+        clear_output()
+        if not db.enabled: return print("DB 미연결")
+        projs = db.get_cad_projects()
+        options = [(f"[{p['id']}] {p['name']}", p['id']) for p in projs]
+        if options:
+            project_dropdown.options = options
+            project_dropdown.value = options[0][1]
+            load_photos(options[0][1])
+        else:
+            project_dropdown.options = []
+            print("프로젝트 없음")
+
+def on_project_change(change):
+    if change['type'] == 'change' and change['name'] == 'value':
+        load_photos(change['new'])
+
+def load_photos(pid):
+    if not pid: return
+    photos = db.get_files(pid)
+    global photo_cache
+    photo_cache = {p['file_id']: p for p in photos}
+    
+    options = []
+    for p in photos:
+        dt = p.get('created_at', '')[:16].replace('T', ' ')
+        lbl = f"{p['file_name']} ({dt})"
+        options.append((lbl, p['file_id']))
+    
+    photo_list_widget.options = options
+    photo_count_lbl.value = f"{len(options)}개의 사진"
+    with preview_output: clear_output()
+
+def on_photo_select(change):
+    if change['type'] == 'change' and change['name'] == 'value':
+        selected_ids = change['new']
+        with preview_output:
+            clear_output()
+            if not selected_ids: return
+            # 마지막 선택된 항목 미리보기
+            last_id = selected_ids[-1]
+            photo = photo_cache.get(last_id)
+            if photo:
+                print(f"파일명: {photo['file_name']}")
+                
+                # R2에서 직접 다운로드 (Public URL 미사용으로 안정성 확보)
+                pid = photo['cad_project_id']
+                fname = photo['file_name']
+                key = f"photos/{pid}/{fname}"
+                
+                img_data = r2.get_object(key)
+                if img_data:
+                    display(widgets.Image(value=img_data, width=300))
+                else:
+                    print("이미지를 불러올 수 없습니다.")
+
+def on_upload_change(change):
+    if not change['new']: return
+    pid = project_dropdown.value
+    if not pid: return
+    
+    # 이벤트가 발생한 위젯에서 파일 가져오기 (안정성 확보)
+    uploaded_files = change.owner.value
+    files_to_process = []
+    
+    # ipywidgets 버전 호환성 처리
+    if isinstance(uploaded_files, dict): # 7.x
+        for fname, info in uploaded_files.items():
+            files_to_process.append({'name': fname, 'content': info['content']})
+    else: # 8.x
+        for info in uploaded_files:
+            content = info.get('content')
+            if hasattr(content, 'tobytes'): content = content.tobytes()
+            files_to_process.append({'name': info.get('name'), 'content': content})
+
+    with upload_output:
+        clear_output()
+        print(f"🚀 총 {len(files_to_process)}개 파일 업로드 시작...")
+        
+        success_cnt = 0
+        for i, f in enumerate(files_to_process):
+            clear_output(wait=True)
+            print(f"⏳ 업로드 중: {i+1}/{len(files_to_process)} - {f['name']}")
+            
+            fname = f['name']
+            raw_data = f['content']
+            
+            # Resize
+            new_fname, mime, data = process_image_data(fname, raw_data)
+            
+            # R2 Upload
+            key = f"photos/{pid}/{new_fname}"
+            if r2.upload_file(key, data, mime):
+                # DB Insert
+                base_url = r2.public_url.rstrip('/')
+                file_url = f"{base_url}/{key}"
+                if db.insert_photo(pid, new_fname, file_url):
+                    success_cnt += 1
+        
+        clear_output(wait=True)
+        print(f"✅ 업로드 완료: {success_cnt}/{len(files_to_process)} 성공")
+        
+        # Reset upload widget (ipywidgets 8.x workaround: replace widget)
+        new_upload = widgets.FileUpload(
+            accept='image/*',
+            multiple=True,
+            description='사진 업로드 (파일 선택)'
+        )
+        new_upload.observe(on_upload_change, names='value')
+        
+        # Update UI
+        upload_container.children = [new_upload]
+        
+        load_photos(pid)
+
+def delete_photos(b):
+    selected_ids = photo_list_widget.value
+    if not selected_ids: return
+    
+    pid = project_dropdown.value
+    
+    with upload_output:
+        clear_output()
+        print(f"{len(selected_ids)}개 항목 삭제 중...")
+        
+        for fid in selected_ids:
+            photo = photo_cache.get(fid)
+            if not photo: continue
+            
+            # R2 Delete
+            key = f"photos/{pid}/{photo['file_name']}"
+            r2.delete_file(key)
+            
+            # DB Delete
+            db.delete_photo(fid)
+            
+        print("삭제 완료.")
+        load_photos(pid)
+
+# --- Layout & Bind ---
+refresh_btn.on_click(load_projects)
+project_dropdown.observe(on_project_change, names='value')
+photo_list_widget.observe(on_photo_select, names='value')
+upload_widget.observe(on_upload_change, names='value')
+delete_btn.on_click(delete_photos)
+
+header = widgets.HBox([project_dropdown, refresh_btn])
+left_pane = widgets.VBox([widgets.Label("사진 목록 (다중 선택 가능)"), photo_list_widget, photo_count_lbl, widgets.HTML("<br>"), upload_container, delete_btn])
+right_pane = widgets.VBox([widgets.Label("미리보기"), preview_output, widgets.HTML("<hr>"), widgets.Label("업로드 로그"), upload_output])
+main_body = widgets.HBox([left_pane, right_pane])
+
+ui = widgets.VBox([title_lbl, header, widgets.HTML("<hr>"), main_body])
+
+# Init
+photo_cache = {}
+load_projects()
+clear_output()
+display(ui)

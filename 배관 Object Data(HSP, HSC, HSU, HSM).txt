@@ -1,0 +1,509 @@
+;;; ==========================================================================
+;;; [HSP_KR] 배관 제원 관리 및 데이터 동기화 시스템
+;;; 지원 환경: AutoCAD Map 3D 2000 이상
+;;;
+;;; [명령어 가이드 및 시스템 설계 의도]
+;;;
+;;; 1. HSP (HSP Entry) : 배관 제원 입력 및 객체 연결
+;;;    - 배관(Polyline)에 속성(Object Data)을 부여하고 지시선 텍스트를 생성합니다.
+;;;    - 배관과 텍스트를 XData(HSP_LINK)로 묶어, 하나가 수정되어도 서로를 추적할 수 있게 설계되었습니다.
+;;;
+;;; 2. HSU (HSP Update) : 데이터 기반 텍스트 일괄 갱신
+;;;    - [필요성] AutoCAD 특성창(Properties)에서 Object Data를 수정하면 DB값은 바뀌지만, 
+;;;      독립된 엔티티인 '텍스트 객체'는 자동으로 변하지 않습니다. (AutoCAD의 구조적 특징)
+;;;    - [용도] 속성 정보를 대량으로 수정한 후, 화면에 보이는 제원 표시를 최신 데이터와 
+;;;      강제로 일치시켜 데이터와 도면의 동기화를 보장합니다.
+;;;
+;;; 3. HSC (HSP Check) : 데이터 무결성(Integrity) 검증
+;;;    - [필요성] 사용자의 실수로 텍스트만 고치거나, 속성 수정을 누락하여 발생하는 
+;;;      '속성값과 도면 표시의 불일치'는 GIS 데이터 구축 시 치명적인 오류가 됩니다.
+;;;    - [용도] 도면 마감 전 전체 검사를 수행하여, 원본 데이터(OD)와 화면 표시(Text)가 
+;;;      다른 객체들을 자동으로 찾아 노란색 원을 생성함으로써 도면의 신뢰도를 검증합니다.
+;;;
+;;; 4. HSM (HSP Missing) : 데이터 누락 객체 탐색
+;;;    - [필요성] 도면 내 모든 배관에 데이터가 입력되었는지 전수 조사하기 위함입니다.
+;;;    - [용도] 사용자가 선택한 배관 중 Object Data(HSP_DATA)가 없는 객체에 노란색 원을 생성합니다.
+;;; ==========================================================================
+
+(vl-load-com)
+
+;; XData 애플리케이션 등록
+(if (not (tblsearch "APPID" "HSP_LINK")) (regapp "HSP_LINK"))
+
+;; --- 전역 변수: 마지막 입력값 저장 ---
+(if (not *hsp:settings*)
+  (setq *hsp:settings*
+    (list
+      '("id_num"  . "1001")
+      '("sulchi"  . "2026")
+      '("yongdo"  . "0")
+      '("jilsel"  . "0")
+      '("gandan1" . "200")
+      '("gandan2" . "0")
+      '("minsim"  . "0.0")
+      '("maxsim"  . "0.0")
+      '("lcolor"  . "0")
+      '("tcolor"  . "0")
+      '("txt_ht"  . "1.0")
+      '("txt_st"  . "ghs") ; 기본 스타일을 ghs로 변경
+    )
+  )
+)
+
+;; --- 설정값 가져오기/저장 헬퍼 ---
+(defun hsp:get_setting (key / val)
+  (setq val (if *hsp:settings* (cdr (assoc key *hsp:settings*)) nil))
+  (cond
+    ((and val (/= val "")) val)
+    ((= key "id_num") "1001")
+    ((= key "sulchi") "2026")
+    ((= key "gandan1") "200")
+    ((= key "gandan2") "0")
+    ((member key '("jilsel" "lcolor" "tcolor")) "0") 
+    ((= key "yongdo") "0")
+    ((= key "txt_ht") "1.0")
+    ((= key "txt_st") "ghs")
+    (t "")
+  )
+)
+
+(defun hsp:set_setting (key val / pair)
+  (if (setq pair (assoc key *hsp:settings*))
+    (setq *hsp:settings* (subst (cons key val) pair *hsp:settings*))
+    (setq *hsp:settings* (cons (cons key val) *hsp:settings*))
+  )
+)
+
+;; --- Object Data 테이블 확인 및 생성 (한글 설명 추가) ---
+(defun hsp:check_table (/ tableName tableDef)
+  (setq tableName "HSP_DATA")
+  (if (and ade_odtablelist (null (member (strcase tableName) (mapcar 'strcase (ade_odtablelist)))))
+    (progn
+      (princ (strcat "\n[" tableName "] Object Data 테이블을 생성 중..."))
+      (setq tableDef (list (cons "TableName" tableName) (cons "TableDesc" "하수배관 데이터")
+          (cons "Columns" (list
+            (list (cons "ColName" "ORG_ID") (cons "ColDesc" "시설ID") (cons "ColType" "Character") (cons "DefaultVal" ""))
+            (list (cons "ColName" "PURP")   (cons "ColDesc" "용도")     (cons "ColType" "Character") (cons "DefaultVal" ""))
+            (list (cons "ColName" "YEAR") (cons "ColDesc" "설치연도")   (cons "ColType" "Character") (cons "DefaultVal" ""))
+            (list (cons "ColName" "MAT")  (cons "ColDesc" "관재질")     (cons "ColType" "Character") (cons "DefaultVal" ""))
+            (list (cons "ColName" "DIA1") (cons "ColDesc" "관경1")      (cons "ColType" "Character") (cons "DefaultVal" ""))
+            (list (cons "ColName" "DIA2") (cons "ColDesc" "관경2")      (cons "ColType" "Character") (cons "DefaultVal" ""))
+            (list (cons "ColName" "DMIN") (cons "ColDesc" "최소심도")   (cons "ColType" "Real")      (cons "DefaultVal" 0.0))
+            (list (cons "ColName" "DMAX") (cons "ColDesc" "최대심도")   (cons "ColType" "Real")      (cons "DefaultVal" 0.0))
+            (list (cons "ColName" "DAVG") (cons "ColDesc" "평균심도")   (cons "ColType" "Real")      (cons "DefaultVal" 0.0))
+            (list (cons "ColName" "LEN")  (cons "ColDesc" "연장")       (cons "ColType" "Real")      (cons "DefaultVal" 0.0))
+            (list (cons "ColName" "SPEC") (cons "ColDesc" "전체제원")   (cons "ColType" "Character") (cons "DefaultVal" ""))
+          ))))
+      (if (ade_oddefinetab tableDef) (princ "\n테이블 생성 완료.") (princ "\n테이블 생성 실패."))
+    )
+  )
+  t
+)
+
+;; --- UI 헬퍼 함수 ---
+(defun hsp:clear_jil ()
+  (mapcar '(lambda (k) (set_tile k "0")) '("j0" "j1" "j2" "j3" "j4" "j5" "j6" "j7" "j8" "j9" "j10" "j11" "j12" "j13" "j14" "j15" "j16" "j17"))
+)
+
+(defun hsp:pl_dist (na / n a lst totallen stflag spt ept)
+  (setq n 0 totallen 0.0 stflag "0" lst (entget na))
+  (repeat (length lst)
+    (setq a (nth n lst))
+    (if (equal 10 (car a))
+      (if (= stflag "0") (progn (setq spt (cdr a)) (setq stflag "1"))
+        (progn (setq ept (cdr a)) (setq totallen (+ totallen (distance spt ept))) (setq spt ept))))
+    (setq n (1+ n)))
+  totallen
+)
+
+(defun RTD (a) (/ (* a 180.0) pi))
+(defun dtr (d) (* pi (/ d 180.0)))
+(defun hsp:get_aci (idx_str) (nth (atoi idx_str) '(256 1 2 3 4 5 6 7)))
+
+;; --- 객체의 중간 지점(Midpoint) 계산 함수 ---
+(defun hsp:get-midpoint (en)
+  (vlax-curve-getPointAtDist en 
+    (/ (vlax-curve-getDistAtParam en (vlax-curve-getEndParam en)) 2.0))
+)
+
+;; --- Object Data 기반 제원 문자열 생성 함수 (동기화 및 검증용) ---
+(defun hsp:get-jewon-string (en / purp year mat d1 d2 len davg d_dis dmin dmax)
+  (setq purp (ade_odgetfield en "HSP_DATA" "PURP" 0))
+  (setq year (ade_odgetfield en "HSP_DATA" "YEAR" 0))
+  (setq mat  (ade_odgetfield en "HSP_DATA" "MAT" 0))
+  (setq d1   (ade_odgetfield en "HSP_DATA" "DIA1" 0))
+  (setq d2   (ade_odgetfield en "HSP_DATA" "DIA2" 0))
+  (setq len  (ade_odgetfield en "HSP_DATA" "LEN" 0))
+  (setq davg (ade_odgetfield en "HSP_DATA" "DAVG" 0))
+  (setq dmin (ade_odgetfield en "HSP_DATA" "DMIN" 0))
+  (setq dmax (ade_odgetfield en "HSP_DATA" "DMAX" 0))
+  
+  ; 관경 표시 로직 (DIA2가 0이 아니면 사각, 0이면 원형)
+  (if (and d2 (/= d2 "0") (/= d2 ""))
+    (setq d_dis (strcat d1 "*" d2))
+    (setq d_dis (strcat "%%c" d1))
+  )
+  
+  ; 전체 제원 문자열 조립 (표시용)
+  (strcat year "/" mat "/" d_dis "/L" (rtos len 2 1) "/D" (rtos davg 2 1) "#" (rtos dmin 2 2) "_" (rtos dmax 2 2))
+)
+
+;; --- 객체 간 연결을 위한 XData 저장 함수 ---
+(defun hsp:link-entities (target_en text_en / xdata)
+  (setq xdata (list (list -3 (list "HSP_LINK" (cons 1005 (cdr (assoc 5 (entget text_en))))))))
+  (entmod (append (entget target_en) xdata))
+  
+  (setq xdata (list (list -3 (list "HSP_LINK" (cons 1005 (cdr (assoc 5 (entget target_en))))))))
+  (entmod (append (entget text_en) xdata))
+)
+
+;; --- 메인 명령어 ---
+(defun c:hsp (/ old_layer old_osmode dclpath dcl_id dlg_result id_val sulchi_val gandan1_val minsim_val maxsim_val
+               jilsel jiltext yongdo_idx yongdo_txt dandist gangudist txtsimdo jewon lcolor_idx tcolor_idx lcolor_aci tcolor_aci gandan2_val
+               targetent selgan pt1 pt2 pt3 ang jullen minsim_r maxsim_r txt_pt temp_text_elist text_bounding_box
+               leader_ent text_ent color_list f exist_id_qty final_id txt_ht_val txt_st_val tht)
+
+  ; 1. 환경 설정 및 테이블 체크
+  (setq old_layer (getvar "clayer") old_osmode (getvar "osmode"))
+  (if (null (hsp:check_table))
+    (progn (alert "Map Object Data 기능을 사용할 수 없습니다.") (exit)))
+
+  ; 2. 동적 DCL 생성 (한글 레이블 적용)
+  (setq dclpath (strcat (getenv "TEMP") "\\hsp_dlg.dcl"))
+  (setq f (open dclpath "w"))
+  (write-line "hsp_dlg : dialog { label = \"하수배관 제원 입력 (HSP)\";" f)
+  (write-line " : edit_box { label = \"시설ID(org_id)\"; key = \"id_num\"; edit_width = 15; }" f)
+  (write-line " : edit_box { label = \"설치연도\"; key = \"sulchi\"; edit_width = 15; }" f)
+  (write-line " : boxed_row { label = \"용도 선택\";" f)
+  (write-line "  : radio_button { label = \"오수\"; key = \"y0\"; }" f)
+  (write-line "  : radio_button { label = \"우수\"; key = \"y1\"; }" f)
+  (write-line "  : radio_button { label = \"상수\"; key = \"y2\"; }" f)
+  (write-line " }" f)
+  (write-line " : boxed_column { label = \"관재질 선택\";" f)
+  (write-line "  : radio_row { : radio_button { label=\"없음\"; key=\"j0\"; } : radio_button { label=\"PE2P\"; key=\"j1\"; } : radio_button { label=\"PE3P\"; key=\"j2\"; } : radio_button { label=\"HP\"; key=\"j3\"; } }" f)
+  (write-line "  : radio_row { : radio_button { label=\"PE\"; key=\"j4\"; } : radio_button { label=\"PVCDC\"; key=\"j5\"; } : radio_button { label=\"CP\"; key=\"j6\"; } : radio_button { label=\"GRP\"; key=\"j7\"; } }" f)
+  (write-line "  : radio_row { : radio_button { label=\"U형(개)\"; key=\"j8\"; } : radio_button { label=\"U형(폐)\"; key=\"j9\"; } : radio_button { label=\"개거\"; key=\"j10\"; } : radio_button { label=\"석축\"; key=\"j11\"; } }" f)
+  (write-line "  : radio_row { : radio_button { label=\"흄관\"; key=\"j12\"; } : radio_button { label=\"파형강관\"; key=\"j13\"; } : radio_button { label=\"DCIP\"; key=\"j14\"; } : radio_button { label=\"PFP\"; key=\"j15\"; } }" f)
+  (write-line "  : radio_row { : radio_button { label=\"HIVP\"; key=\"j16\"; } : radio_button { label=\"HIVG2\"; key=\"j17\"; } }" f)
+  (write-line " }" f)
+  (write-line " : row { : edit_box { label = \"관경1(mm)\"; key = \"gandan1\"; } : edit_box { label = \"관경2(mm)\"; key = \"gandan2\"; } }" f)
+  (write-line " : row { : edit_box { label = \"최소심도\"; key = \"minsim\"; } : edit_box { label = \"최대심도\"; key = \"maxsim\"; } }" f)
+  (write-line " : row { : popup_list { label = \"지시선 색상\"; key = \"lcolor\"; width = 15; } : popup_list { label = \"문자 색상\"; key = \"tcolor\"; width = 15; } }" f)
+  (write-line " : row { : edit_box { label = \"글자 높이\"; key = \"txt_ht\"; } : edit_box { label = \"텍스트 스타일\"; key = \"txt_st\"; edit_width = 15; } }" f)
+  (write-line " : row { : button { label = \"확인\"; key = \"accept\"; is_default = true; } : button { label = \"취소\"; key = \"cancel\"; is_cancel = true; } } }" f)
+  (close f)
+
+  (setq dcl_id (load_dialog dclpath))
+  (if (not (new_dialog "hsp_dlg" dcl_id)) (progn (setvar "osmode" old_osmode) (exit)))
+
+  ; 3. 대화상자 초기화
+  (set_tile "id_num" (strcat "PL" (hsp:get_setting "id_num")))
+  (set_tile "sulchi" (hsp:get_setting "sulchi"))
+  (set_tile "gandan1" (hsp:get_setting "gandan1"))
+  (set_tile "gandan2" (hsp:get_setting "gandan2"))
+  (set_tile "minsim" (hsp:get_setting "minsim"))
+  (set_tile "maxsim" (hsp:get_setting "maxsim"))
+  (set_tile "txt_ht" (hsp:get_setting "txt_ht"))
+  (set_tile "txt_st" (hsp:get_setting "txt_st"))
+
+  (setq jilsel (hsp:get_setting "jilsel"))
+  (set_tile (strcat "j" jilsel) "1")
+  
+  (setq yongdo_idx (hsp:get_setting "yongdo"))
+  (set_tile (strcat "y" yongdo_idx) "1")
+  
+  (setq color_list '("Layer별" "빨강" "노랑" "초록" "하늘" "파랑" "분홍" "흰색"))
+  (start_list "lcolor") (mapcar 'add_list color_list) (end_list)
+  (start_list "tcolor") (mapcar 'add_list color_list) (end_list)
+  (set_tile "lcolor" (hsp:get_setting "lcolor"))
+  (set_tile "tcolor" (hsp:get_setting "tcolor"))
+
+  (mapcar '(lambda (i) (action_tile (strcat "j" (itoa i)) (strcat "(hsp:clear_jil)(set_tile \"j" (itoa i) "\" \"1\")(setq jilsel \"" (itoa i) "\")")))
+          '(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17))
+
+  (action_tile "accept"
+    "(setq id_val (get_tile \"id_num\") sulchi_val (get_tile \"sulchi\") yongdo_idx (cond ((= (get_tile \"y0\") \"1\") \"0\") ((= (get_tile \"y1\") \"1\") \"1\") (t \"2\")) gandan1_val (get_tile \"gandan1\") gandan2_val (get_tile \"gandan2\") minsim_val (get_tile \"minsim\") maxsim_val (get_tile \"maxsim\") lcolor_idx (get_tile \"lcolor\") tcolor_idx (get_tile \"tcolor\") txt_ht_val (get_tile \"txt_ht\") txt_st_val (get_tile \"txt_st\"))(done_dialog 1)")
+  (setq dlg_result (start_dialog))
+  (unload_dialog dcl_id)
+
+  (if (= dlg_result 1)
+    (progn
+      (hsp:set_setting "gandan1" gandan1_val) (hsp:set_setting "gandan2" gandan2_val) (hsp:set_setting "minsim" minsim_val) (hsp:set_setting "yongdo" yongdo_idx)
+      (hsp:set_setting "maxsim" maxsim_val) (hsp:set_setting "lcolor" lcolor_idx) (hsp:set_setting "tcolor" tcolor_idx)
+      (hsp:set_setting "txt_ht" txt_ht_val) (hsp:set_setting "txt_st" txt_st_val)
+
+      (setq yongdo_txt (nth (atoi yongdo_idx) '("오수" "우수" "상수")))
+
+      (setq jiltext (nth (atoi jilsel) '("" "PE2P" "PE3P" "HP" "PE" "PVCDC" "CP" "GRP" "U-Type(O)" "U-Type(C)" "O-Ditch" "StoneW" "LO/HP" "LO-CSP" "DCIP" "PFP" "HIVP" "HIVG2")))
+      ; 관경 표시 로직 수정: gandan2가 0이 아니면 사각관로(파이 기호 제외), 0이면 원형관로(파이 기호 추가)
+      (if (and gandan2_val (/= gandan2_val "0") (/= gandan2_val ""))
+        (setq dandist (strcat gandan1_val "*" gandan2_val) dandist_display (strcat gandan1_val "*" gandan2_val))
+        (setq dandist (strcat "D" gandan1_val) dandist_display (strcat "%%c" gandan1_val))
+      )
+      (setq minsim_r (atof minsim_val) maxsim_r (atof maxsim_val))
+      (setq txtsimdo (rtos (/ (+ maxsim_r minsim_r) 2.0) 2 1))
+
+      (setq targetent (entsel "\nHSP >> 대상 배관(Polyline)을 선택하세요: "))
+      (if (not targetent) (progn (setvar "clayer" old_layer) (setvar "osmode" old_osmode) (exit)))
+      (setq selgan (car targetent) gangudist (hsp:pl_dist selgan))
+
+      ; 시설ID 로직: 기존 ID가 있으면 유지, 없으면 신규 부여
+      (setq exist_id_qty (if (member (strcase "HSP_DATA") (mapcar 'strcase (ade_odtablelist))) 
+                             (ade_odrecordqty selgan "HSP_DATA") 0))
+      (if (> exist_id_qty 0)
+        (setq final_id (ade_odgetfield selgan "HSP_DATA" "ORG_ID" 0))
+        (progn 
+          (setq final_id id_val)
+          ; 신규 부여시에만 다음 번호를 증가시켜 저장 (PL 접두어 제외한 숫자 부분)
+          (if (wcmatch final_id "PL*")
+            (hsp:set_setting "id_num" (itoa (1+ (atoi (substr final_id 3)))))
+            (hsp:set_setting "id_num" (itoa (1+ (atoi final_id))))
+          )
+        )
+      )
+      (hsp:set_setting "sulchi" sulchi_val) (hsp:set_setting "jilsel" jilsel)
+      
+      ; 지시선 및 텍스트 그리기
+      (setvar "osmode" 512) (setq pt1 (getpoint "\n지시선 시작점: "))
+
+      ; 표시용 텍스트 생성 (로직 분리 전 임시 생성 - 실제 저장은 하단 OD 업데이트 후 다시 확인)
+      (setq jewon_display (strcat sulchi_val "/" jiltext "/" dandist_display "/L" (rtos gangudist 2 1) "/D" txtsimdo "#" (rtos minsim_r 2 2) "_" (rtos maxsim_r 2 2)))
+
+      (setvar "osmode" 0) (setq pt2 (getpoint pt1 "\n지시선 꺽임점: "))
+      (setq ang (getangle pt2 "\n텍스트 각도 (0, 90, 180, 270) <0>: "))
+      (if (not ang)
+        (setq ang 0.0)
+        (setq ang (rem (* (/ pi 2.0) (fix (+ 0.5 (/ ang (/ pi 2.0))))) (* 2.0 pi)))
+      )
+
+      ; 인출선 방향 및 지시선 타입(수평/수직) 판단
+      (setq dx (- (car pt2) (car pt1)) dy (- (cadr pt2) (cadr pt1)))
+      (setq is_horz (or (equal ang 0.0 0.001) (equal ang pi 0.001) (equal ang (* pi 2.0) 0.001)))
+
+      ; 사용자 입력 높이 적용
+      (setq tht (atof txt_ht_val))
+      (if (<= tht 0.0) (setq tht 1.0))
+      
+      ; 입력한 텍스트 스타일 적용
+      (if (and txt_st_val (/= txt_st_val ""))
+        (setvar "TEXTSTYLE" txt_st_val)
+      )
+      
+      ; 텍스트 너비 계산
+      (setq temp_text_elist (list (cons 1 jewon_display) (cons 40 tht) (cons 7 (getvar "TEXTSTYLE"))))
+      (setq text_bounding_box (textbox temp_text_elist))
+      (setq text_width (abs (- (car (cadr text_bounding_box)) (car (car text_bounding_box)))))
+
+      ; 여백 설정 (고정 0.65배)
+      (setq x_gap (* tht 0.65))
+
+      ; [특수 케이스] 인출선 방향에 따른 동적 여백 조정 로직 유지
+      (if (and is_horz
+               (or (and (>= dx 0) (< dy 0) (equal ang pi 0.001))     ; +x, -y 방향 + 왼쪽 지시선
+                   (and (< dx 0) (< dy 0) (equal ang 0.0 0.001))))  ; -x, -y 방향 + 오른쪽 지시선
+        (progn
+          ; 수직 목표 높이: 텍스트 상단(1.65) + 여유(0.35) = tht * 2.0
+          ; x_gap = (수직 목표 높이 * 수평이동량) / 수직이동량 + 여유 여백
+          (setq x_gap (+ (* tht 1.0) (/ (* tht 2.0 (abs dx)) (max 0.1 (abs dy)))))
+          
+          ; 너무 과도하게 길어지는 것 방지 (글자 너비의 1.5배 또는 글자높이 10배 중 큰 값으로 제한)
+          (setq max_gap (max (* text_width 1.5) (* tht 10.0)))
+          (if (> x_gap max_gap) (setq x_gap max_gap))
+        )
+      )
+
+      ; [동적 결정] 지시선 끝점(pt3) 위치를 텍스트 길이에 맞춰 확정
+      (if is_horz
+        ; 수평 지시선: 유동적 여백(x_gap) + 텍스트 너비 + 끝단 여유(0.5)
+        (setq jullen (+ x_gap text_width (* tht 0.5)))
+        ; 수직 지시선: 텍스트 너비 + 최소한의 여유(tht * 0.5)로 수평보다 짧게 설정
+        (setq jullen (+ text_width (* tht 0.5)))
+      )
+      (setq pt3 (polar pt2 ang jullen))
+      
+      (setq x1 (car pt2) y1 (cadr pt2))
+
+      (cond
+        (is_horz ; 수평 지시선 (항상 상단 배치)
+          (setq text_rot 0.0)
+          (if (equal ang 0.0 0.001)
+            (setq txt_pt (list (+ x1 x_gap) (+ y1 (* tht 0.65)))) ; 오른쪽 방향 (여백 복원)
+            (setq txt_pt (list (- x1 x_gap text_width) (+ y1 (* tht 0.65)))) ; 왼쪽 방향 (여백 복원)
+          )
+        )
+        (t ; 수직 지시선 (기존 로직 유지하되 높이 변수 적용)
+          (if (>= dx 0)
+            (setq text_rot (dtr 270) txt_pt (list (+ x1 (* tht 0.65)) (max y1 (cadr pt3))))
+            (setq text_rot (dtr 90) txt_pt (list (- x1 (* tht 0.65)) (min y1 (cadr pt3))))
+          )
+        )
+      )
+
+      (setq lcolor_aci (hsp:get_aci lcolor_idx) tcolor_aci (hsp:get_aci tcolor_idx))
+
+      (command "layer" "m" "SB013" "")
+      (command "pline" pt1 pt2 pt3 "") (setq leader_ent (entlast))
+      ; 텍스트 스타일이 고정 높이인지 확인하여 명령 실행
+      (if (= 0 (cdr (assoc 40 (tblsearch "STYLE" (getvar "TEXTSTYLE")))))
+        (command "text" txt_pt tht (RTD text_rot) jewon_display)
+        (command "text" txt_pt (RTD text_rot) jewon_display)
+      )
+      (setq text_ent (entlast))
+      (command "chprop" leader_ent "" "C" lcolor_aci "")
+      (command "chprop" text_ent  "" "C" tcolor_aci "")
+
+      ; Object Data 저장
+      (if (null (member (strcase "HSP_DATA") (mapcar 'strcase (ade_odtablelist)))) (hsp:check_table))
+      (if (= exist_id_qty 0) (ade_odaddrecord selgan "HSP_DATA"))
+      (ade_odsetfield selgan "HSP_DATA" "ORG_ID" 0 final_id)
+      (ade_odsetfield selgan "HSP_DATA" "PURP"   0 yongdo_txt)
+      (ade_odsetfield selgan "HSP_DATA" "YEAR" 0 sulchi_val)
+      (ade_odsetfield selgan "HSP_DATA" "MAT" 0 jiltext)
+      (ade_odsetfield selgan "HSP_DATA" "DIA1" 0 (if gandan1_val gandan1_val ""))
+      (ade_odsetfield selgan "HSP_DATA" "DIA2" 0 gandan2_val)
+      (ade_odsetfield selgan "HSP_DATA" "DMIN" 0 minsim_r)
+      (ade_odsetfield selgan "HSP_DATA" "DMAX" 0 maxsim_r)
+      (ade_odsetfield selgan "HSP_DATA" "DAVG" 0 (atof txtsimdo))
+      (ade_odsetfield selgan "HSP_DATA" "LEN" 0 gangudist)
+      (ade_odsetfield selgan "HSP_DATA" "SPEC" 0 (hsp:get-jewon-string selgan))
+
+      ; 객체 간 연결 설정
+      (hsp:link-entities selgan text_ent)
+
+      (setvar "clayer" old_layer) (setvar "osmode" old_osmode)
+      (princ "\n입력 완료.")
+    ))
+  (princ)
+)
+
+;;; ==========================================================================
+;;; Command: HSU (HSP Update) - 속성창 수정 내용을 텍스트에 일괄 반영
+;;; ==========================================================================
+(defun c:hsu (/ ss i en ent xdata txt_h txt_en new_str)
+  (princ "\n[HSU] 정적 업데이트: 지시선 좌표는 유지하고 텍스트 내용만 동기화합니다.")
+  (setq ss (ssget '((0 . "LWPOLYLINE,POLYLINE"))))
+  (if (null ss) (setq ss (ssget "X" '((0 . "LWPOLYLINE,POLYLINE") (-3 ("HSP_LINK"))))))
+  
+  (if ss
+    (progn
+      (setq i 0)
+      (repeat (sslength ss)
+        (setq en (ssname ss i))
+        (setq ent (entget en '("HSP_LINK")))
+        (if (setq xdata (assoc -3 ent))
+          (progn
+            (setq txt_h (cdr (assoc 1005 (cdadr xdata))))
+            (setq txt_en (handent txt_h))
+            (if (and txt_en (entget txt_en))
+              (progn
+                (setq new_str (hsp:get-jewon-string en))
+                (entmod (subst (cons 1 new_str) (assoc 1 (entget txt_en)) (entget txt_en)))
+                (ade_odsetfield en "HSP_DATA" "SPEC" 0 new_str)
+              )
+            )
+          )
+        )
+        (setq i (1+ i))
+      )
+      (princ (strcat "\n[성공] " (itoa i) "개의 객체가 최신 데이터로 업데이트되었습니다."))
+    )
+  )
+  (princ)
+)
+
+;;; ==========================================================================
+;;; Command: HSC (HSP Check) - 데이터와 텍스트의 불일치 검성
+;;; ==========================================================================
+(defun c:hsc (/ ss i en ent xdata txt_h txt_en od_str txt_str err_count)
+  (setq ss (ssget "X" '((0 . "LWPOLYLINE,POLYLINE") (-3 ("HSP_LINK")))))
+  (if ss
+    (progn
+      ; 레이어 생성 및 확인
+      (if (not (tblsearch "LAYER" "_OD_불일치")) (command "layer" "m" "_OD_불일치" "c" "2" "" ""))
+      
+      (setq i 0 err_count 0)
+      (repeat (sslength ss)
+        (setq en (ssname ss i))
+        (setq ent (entget en '("HSP_LINK")))
+        (setq xdata (assoc -3 ent))
+        (setq txt_h (cdr (assoc 1005 (cdadr xdata))))
+        (setq txt_en (handent txt_h))
+        
+        (if (and txt_en (setq txt_ent (entget txt_en)))
+          (progn
+            (setq od_str (hsp:get-jewon-string en))
+            (setq txt_str (cdr (assoc 1 txt_ent)))
+            (if (/= od_str txt_str)
+              (progn
+                ; 불일치 지점에 노란색 원 생성 (_OD_불일치 레이어)
+                (entmake (list (cons 0 "CIRCLE") (cons 8 "_OD_불일치") (cons 62 2) (cons 10 (hsp:get-midpoint en)) (cons 40 6.0)))
+                (setq err_count (1+ err_count))
+                (princ (strcat "\n[불일치 발견] 시설ID: " (ade_odgetfield en "HSP_DATA" "ORG_ID" 0)))
+              )
+            )
+          )
+        )
+        (setq i (1+ i))
+      )
+      (if (> err_count 0)
+        (progn
+          (princ (strcat "\n[주의] 총 " (itoa err_count) "개의 객체에서 데이터 불일치가 발견되었습니다."))
+          (princ "\n노란색 원으로 표시된 위치를 확인하고 HSU 명령으로 동기화하십시오.")
+        )
+        (princ "\n[검사 완료] 모든 데이터와 텍스트가 일치합니다.")
+      )
+    )
+    (princ "\n[정보] 연결된 HSP 데이터 객체가 도면에 없습니다.")
+  )
+  (princ)
+)
+
+;;; ==========================================================================
+;;; Command: HSM (HSP Missing) - Object Data가 없는 누락 객체 탐색
+;;; ==========================================================================
+(defun c:hsm (/ ss i en miss_count qty)
+  (princ "\n[데이터 누락 검사] 검사할 배관 객체들을 선택하세요: ")
+  
+  ; 사용자가 선택한 라인과 폴리라인만 검사
+  (setq ss (ssget '((0 . "LINE,LWPOLYLINE,POLYLINE"))))
+  
+  (if ss
+    (progn
+      ; 레이어 생성 및 확인
+      (if (not (tblsearch "LAYER" "_OD_미입력")) (command "layer" "m" "_OD_미입력" "c" "2" "" ""))
+
+      (setq i 0 miss_count 0)
+      (repeat (sslength ss)
+        (setq en (ssname ss i))
+        
+        ; HSP_DATA 레코드 수 확인
+        (setq qty (if (member (strcase "HSP_DATA") (mapcar 'strcase (ade_odtablelist)))
+                      (ade_odrecordqty en "HSP_DATA") 0))
+        
+        ; 레코드가 0개인 경우 누락 세트에 추가
+        (if (= qty 0)
+          (progn
+            ; 누락 지점에 노란색 원 생성 (_OD_미입력 레이어)
+            (entmake (list (cons 0 "CIRCLE") (cons 8 "_OD_미입력") (cons 62 2) (cons 10 (hsp:get-midpoint en)) (cons 40 6.0)))
+            (setq miss_count (1+ miss_count))
+          )
+        )
+        (setq i (1+ i))
+      )
+      
+      (if (> miss_count 0)
+        (progn
+          (princ (strcat "\n[주의] 선택 영역 중 " (itoa miss_count) "개의 객체에 데이터가 누락되었습니다."))
+          (princ "\n노란색 원으로 표시된 위치에 HSP 명령으로 데이터를 입력하세요.")
+        )
+        (princ "\n[검사 완료] 선택한 모든 배관에 데이터가 정상적으로 입력되어 있습니다.")
+      )
+    )
+    (princ "\n[정보] 도면에 검사할 배관 객체가 없습니다.")
+  )
+  (princ)
+)
+
+(princ "\nHSP_KR (배관 제원 입력) 로드됨. 실행하려면 HSP를 입력하세요.")
+(princ "\n데이터 동기화: HSU, 데이터 검증: HSC, 누락 탐색: HSM 명령을 사용하세요.")
+(princ)

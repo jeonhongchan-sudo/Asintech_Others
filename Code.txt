@@ -1,0 +1,836 @@
+// ==========================================
+// 설정 상수
+// ==========================================
+const CONFIG = {
+  PARENT_FOLDER_ID: '1q3P5mxJ1Ze578xNzOdmOOAeMpS6xQDoh',
+  GUIDELINE_FILE_ID: '1mysxDT9bfxcdh2-DXDW9NLnOZOCRQ7lF',
+  NUMERIC_MAP_FILE_ID: '1-TI3CJ1kR5uTOi1Zjs1EWcreqWsAlR9v',
+  SVG_FOLDER_ID: '1t2wmBiLEn9PZ41AT9ojR1uNrQSh-r4Ou', // SVG 폴더 ID
+  CACHE_KEY_PROJECTS: 'CACHE_PROJECTS_LIST', 
+  CACHE_DURATION: 21600,
+  MEMO_PHOTO_FOLDER_ID: '1hzpvsiBXzcudhbwVKk670eSxNuomHSQt', // [추가] 메모 사진 저장 폴더
+};
+
+// ==========================================
+// 웹앱 진입점
+// ==========================================
+function doGet(e) {
+  if (e && e.parameter && e.parameter.action) {
+    return handleApiRequest(e);
+  }
+  return ContentService.createTextOutput("Asin Tech API Server is running. (v4.1-Drive-Final)");
+}
+
+function doPost(e) {
+  const params = e.postData ? JSON.parse(e.postData.contents) : {};
+  if (!e.postData && e.parameter) Object.assign(params, e.parameter);
+  return handleApiRequest({ parameter: params });
+}
+
+function handleApiRequest(e) {
+  const action = e.parameter.action;
+  let response = {};
+  
+  try {
+    switch (action) {
+      case 'getProjects': response = getProjects(); break;
+      case 'getAllProjects': response = getProjects(); break;
+      case 'createProject': response = createProject(e.parameter.projectName, e.parameter.skipDb); break;
+      case 'renameProject': response = renameProject(e.parameter.projectId, e.parameter.newName); break;
+      case 'deleteProject': response = deleteProject(e.parameter.projectId); break;
+      case 'getPhotosByProject': response = getPhotos(e.parameter.projectId); break;
+      case 'getFiles': response = getPhotos(e.parameter.projectId); break;
+      case 'uploadPhoto': response = uploadPhoto(e.parameter.projectId, e.parameter.fileData, e.parameter.fileName, e.parameter.skipDb); break;
+      case 'deletePhoto': response = deletePhoto(e.parameter.fileId); break;
+      case 'renamePhoto': response = renamePhoto(e.parameter.fileId, e.parameter.newFileName); break;
+      case 'synchronizePhotos': response = synchronizePhotos(e.parameter.projectId, e.parameter.continuationToken); break;
+      case 'cleanupAllDriveOrphans': response = cleanupAllDriveOrphans(e.parameter.continuationToken); break;
+      case 'synchronizeAll': response = synchronizeAllProjects(); break;
+      case 'checkForUpdates': response = checkForUpdates(e.parameter.lastSyncTime); break;
+      case 'exportToCSV': response = exportToCSV(e.parameter.projectId); break;
+      
+      // [CAD 관리]
+      case 'getCadProjects': response = getCadProjects(); break;
+      case 'createCadProject': response = createCadProject(e.parameter.name); break;
+      case 'renameCadProject': response = renameCadProject(e.parameter.id, e.parameter.newName); break;
+      case 'deleteCadProject': response = deleteCadProject(e.parameter.id); break;
+      case 'getCadObjects': response = getCadObjects(e.parameter.projectId); break;
+      case 'uploadCadObjects': response = uploadCadObjects(e.parameter.projectId, e.parameter.data); break;
+      case 'deleteCadObjects': response = deleteCadObjects(e.parameter.ids); break;
+      case 'deleteProjectCadObjects': response = deleteProjectCadObjects(e.parameter.projectId); break;
+
+      // 지침서 PDF
+      case 'getGuidelineMeta': response = getGuidelineMeta(); break;
+      case 'getGuidelinePdf': response = getGuidelinePdf(); break;
+      case 'getNumericMapPdf': response = getNumericMapPdf(); break;
+
+      // [SVG 관리]
+      case 'getSvgs': response = getSvgs(e.parameter.folderId); break;
+      case 'uploadSvg': response = uploadSvg(e.parameter.folderId, e.parameter.fileData, e.parameter.fileName, e.parameter.skipDb); break;
+      case 'synchronizeSvgs': response = syncSvgLibrary(e.parameter.continuationToken); break;
+
+      // [설정]
+      case 'getSupabaseConfig': response = getSupabaseConfig(); break;
+
+      // [GitHub Action]
+      case 'triggerGitHubAction': response = triggerGitHubAction(e.parameter.projectId); break;
+
+      // [메모 관리]
+      case 'uploadToDrive': response = uploadToDrive(e.parameter.fileName, e.parameter.fileData, e.parameter.mimeType); break;
+
+      default: response = { success: false, error: 'Unknown action' };
+    }
+  } catch (error) {
+    response = { success: false, error: error.toString() };
+  }
+  return ContentService.createTextOutput(JSON.stringify(response)).setMimeType(ContentService.MimeType.JSON);
+}
+
+// ==========================================
+// 유틸리티 및 프로젝트 관리 함수
+// ==========================================
+function formatDate(date) {
+  if (!date) return '';
+  if (date instanceof Date) return date.toISOString();
+  return String(date);
+}
+
+function checkForUpdates(clientLastSyncTime) {
+  return { success: true, hasChanges: false };
+}
+
+function getGuidelineMeta() {
+  try {
+    const file = DriveApp.getFileById(CONFIG.GUIDELINE_FILE_ID);
+    return { success: true, lastUpdated: file.getLastUpdated().getTime() };
+  } catch (e) { return { success: false, error: e.toString() }; }
+}
+
+function getGuidelinePdf() {
+  try {
+    const file = DriveApp.getFileById(CONFIG.GUIDELINE_FILE_ID);
+    const blob = file.getBlob();
+    return { success: true, data: Utilities.base64Encode(blob.getBytes()), name: file.getName(), lastUpdated: file.getLastUpdated().getTime() };
+  } catch (e) { return { success: false, error: '지침서 로드 실패: ' + e.toString() }; }
+}
+
+function getNumericMapPdf() {
+  try {
+    const file = DriveApp.getFileById(CONFIG.NUMERIC_MAP_FILE_ID);
+    const blob = file.getBlob();
+    return { success: true, data: Utilities.base64Encode(blob.getBytes()), name: file.getName(), lastUpdated: file.getLastUpdated().getTime() };
+  } catch (e) { return { success: false, error: '수치지도 도엽번호 로드 실패: ' + e.toString() }; }
+}
+
+function clearProjectCache() { try { CacheService.getScriptCache().remove(CONFIG.CACHE_KEY_PROJECTS); } catch (e) {} }
+
+function getProjects() {
+  try {
+    const cache = CacheService.getScriptCache();
+    const cachedData = cache.get(CONFIG.CACHE_KEY_PROJECTS);
+    if (cachedData) return JSON.parse(cachedData);
+
+    const data = callSupabase('projects?select=*&order=created_at.desc', 'get');
+    if (!Array.isArray(data)) return { success: true, projects: [] };
+
+    const projects = data.map(row => ({ name: row.project_name, id: row.folder_id, createdDate: row.created_at, status: row.status }));
+    const result = { success: true, projects: projects };
+    try { cache.put(CONFIG.CACHE_KEY_PROJECTS, JSON.stringify(result), CONFIG.CACHE_DURATION); } catch(e) {}
+    return result;
+  } catch (error) { return { success: false, error: '프로젝트 조회 오류: ' + error.toString() }; }
+}
+
+function synchronizeAllProjects() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) return { success: false, error: '다른 작업이 진행 중입니다.' };
+  
+  try {
+    clearProjectCache();
+    const svgResult = syncSvgLibrary();
+    let svgMsg = svgResult.success ? ` [SVG: ${svgResult.message}]` : ` [SVG 오류: ${svgResult.error}]`;
+    
+    let parentFolder = DriveApp.getFolderById(CONFIG.PARENT_FOLDER_ID);
+    const driveFoldersMap = new Map();
+    const folders = parentFolder.getFolders();
+    while (folders.hasNext()) { const folder = folders.next(); driveFoldersMap.set(folder.getId(), { name: folder.getName(), createdDate: folder.getDateCreated() }); }
+
+    const dbProjects = callSupabase('projects?select=*', 'get');
+    const dbMap = new Map();
+    if (Array.isArray(dbProjects)) dbProjects.forEach(p => dbMap.set(p.folder_id, p));
+
+    let addedCount = 0, updatedCount = 0, deletedCount = 0;
+
+    for (const [id, info] of driveFoldersMap) {
+      if (dbMap.has(id)) {
+        if (dbMap.get(id).project_name !== info.name) {
+          callSupabase(`projects?folder_id=eq.${id}`, 'patch', { project_name: info.name });
+          updatedCount++;
+        }
+        dbMap.delete(id);
+      } else {
+        callSupabase('projects', 'post', { project_name: info.name, folder_id: id, status: 'Active', created_at: info.createdDate.toISOString() });
+        addedCount++;
+      }
+    }
+
+    for (const folderId of dbMap.keys()) {
+      callSupabase(`projects?folder_id=eq.${folderId}`, 'delete');
+      deletedCount++;
+    }
+
+    return { success: true, message: `동기화 완료: +${addedCount} / ~${updatedCount} / -${deletedCount}${svgMsg}`, syncTime: new Date().getTime() };
+  } catch (error) { return { success: false, error: '전체 동기화 오류: ' + error.toString() }; }
+  finally { lock.releaseLock(); }
+}
+
+function createProject(projectName, skipDb) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return { success: false, error: '서버가 바쁩니다.' };
+  const shouldSkipDb = String(skipDb).toLowerCase() === 'true';
+
+  try {
+    clearProjectCache();
+    if (!shouldSkipDb) {
+      const existing = callSupabase(`projects?project_name=eq.${encodeURIComponent(projectName)}`, 'get');
+      if (Array.isArray(existing) && existing.length > 0) return { success: false, error: '이미 존재하는 프로젝트명' };
+    }
+    
+    const projectsFolder = DriveApp.getFolderById(CONFIG.PARENT_FOLDER_ID);
+    const newFolder = projectsFolder.createFolder(projectName);
+    newFolder.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    
+    if (!shouldSkipDb) {
+      callSupabase('projects', 'post', { project_name: projectName, folder_id: newFolder.getId(), status: 'Active' });
+    }
+    return { success: true, message: '프로젝트 생성 성공', folderId: newFolder.getId() };
+  } catch (error) { return { success: false, error: '생성 오류: ' + error.toString() }; }
+  finally { lock.releaseLock(); }
+}
+
+function deleteProject(projectId) {
+  try {
+    clearProjectCache();
+    callSupabase(`projects?folder_id=eq.${projectId}`, 'delete');
+    try { DriveApp.getFolderById(projectId).setTrashed(true); } catch (e) {}
+    return { success: true, message: '삭제 완료' };
+  } catch (error) { return { success: false, error: '삭제 오류: ' + error.toString() }; }
+}
+
+function renameProject(projectId, newName) {
+  try {
+    clearProjectCache();
+    callSupabase(`projects?folder_id=eq.${projectId}`, 'patch', { project_name: newName });
+    try { DriveApp.getFolderById(projectId).setName(newName); } catch(e) {}
+    return { success: true, message: '이름 변경 완료' };
+  } catch (error) { return { success: false, error: '변경 오류: ' + error.toString() }; }
+}
+
+function uploadPhoto(projectId, fileData, fileName, skipDb) {
+  try {
+    const shouldSkipDb = String(skipDb).toLowerCase() === 'true';
+    const contentType = fileData.substring(5, fileData.indexOf(';'));
+    const bytes = Utilities.base64Decode(fileData.substring(fileData.indexOf(',') + 1));
+    const blob = Utilities.newBlob(bytes, contentType, fileName);
+    const file = DriveApp.getFolderById(projectId).createFile(blob);
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    
+    const fileId = file.getId();
+    const fileUrl = `https://drive.google.com/file/d/${fileId}/view?usp=sharing`;
+    const now = new Date();
+
+    if (!shouldSkipDb) {
+      callSupabase('photos', 'post', { cad_project_id: projectId, file_id: fileId, file_name: fileName, file_url: fileUrl, created_at: now.toISOString() });
+    }
+    return { success: true, message: '업로드 성공', photo: { fileId: fileId, fileName: fileName, url: fileUrl, uploadDate: formatDate(now) } };
+  } catch (error) { return { success: false, error: '업로드 오류: ' + error.toString() }; }
+}
+
+function getPhotos(projectId) {
+  try {
+    const data = callSupabase(`photos?cad_project_id=eq.${projectId}&select=*&order=created_at.desc`, 'get');
+    if (!Array.isArray(data)) return { success: true, photos: [] };
+    const photos = data.map(row => ({ fileName: row.file_name, url: row.file_url, fileId: row.file_id, uploadDate: row.created_at }));
+    return { success: true, photos: photos };
+  } catch (error) { return { success: false, error: '조회 오류: ' + error.toString() }; }
+}
+
+function deletePhoto(fileId) {
+  try {
+    try { DriveApp.getFileById(fileId).setTrashed(true); } catch(e) {}
+    callSupabase(`photos?file_id=eq.${fileId}`, 'delete');
+    return { success: true, message: '삭제됨' };
+  } catch (error) { return { success: false, error: '삭제 오류: ' + error.toString() }; }
+}
+
+function renamePhoto(fileId, newFileName) {
+  try {
+    try { DriveApp.getFileById(fileId).setName(newFileName); } catch(e) {}
+    callSupabase(`photos?file_id=eq.${fileId}`, 'patch', { file_name: newFileName });
+    return { success: true, message: '이름 변경됨' };
+  } catch (error) { return { success: false, error: '변경 오류: ' + error.toString() }; }
+}
+
+function synchronizePhotos(projectId, continuationToken) {
+  try {
+    const startTime = new Date().getTime();
+    const TIME_LIMIT = 210 * 1000;
+    
+    const dbPhotos = callSupabase(`photos?cad_project_id=eq.${projectId}&select=file_id,file_name`, 'get');
+    const dbMap = new Map();
+    if (Array.isArray(dbPhotos)) dbPhotos.forEach(p => dbMap.set(p.file_id, p.file_name));
+
+    let files = continuationToken ? DriveApp.continueFileIterator(continuationToken) : DriveApp.getFolderById(projectId).getFiles();
+    let processedCount = 0, addedCount = 0;
+    
+    while (files.hasNext()) {
+      if (new Date().getTime() - startTime > TIME_LIMIT) {
+          return { success: true, finished: false, continuationToken: files.getContinuationToken(), processedCount: processedCount, message: `진행 중...` };
+      }
+      const file = files.next();
+      processedCount++;
+      if (!file.getMimeType().startsWith('image/')) continue;
+      
+      const fileId = file.getId();
+      const fileName = file.getName();
+
+      if (dbMap.has(fileId)) {
+        if (dbMap.get(fileId) !== fileName) callSupabase(`photos?file_id=eq.${fileId}`, 'patch', { file_name: fileName });
+      } else {
+        callSupabase('photos', 'post', { cad_project_id: projectId, file_id: fileId, file_name: fileName, file_url: `https://drive.google.com/file/d/${fileId}/view?usp=sharing`, created_at: file.getDateCreated().toISOString() });
+        addedCount++;
+      }
+    }
+    return { success: true, finished: true, processedCount: processedCount, message: `동기화 완료! (${addedCount}개 추가됨)` };
+  } catch (error) { return { success: false, error: '동기화 오류: ' + error.toString() }; }
+}
+
+// [수정] 전체 고아 파일 정리 (프로젝트 ID 무관하게 DB 전체와 비교)
+function cleanupAllDriveOrphans(continuationToken) {
+  const startTime = new Date().getTime();
+  const TIME_LIMIT = 200 * 1000; 
+  
+  try {
+    const validIds = new Set();
+    
+    // 1. 모든 테이블에서 유효한 file_id 수집 (한 번에 전체 조회)
+    const photos = callSupabase('photos?select=file_id', 'get');
+    if (Array.isArray(photos)) photos.forEach(p => { if(p.file_id) validIds.add(p.file_id); });
+    
+    const memos = callSupabase('memos?image_url=not.is.null&select=image_url', 'get');
+    if (Array.isArray(memos)) {
+      memos.forEach(m => {
+        String(m.image_url).split(',').forEach(u => {
+          const id = extractFileIdFromUrl(u.trim()); if(id) validIds.add(id);
+        });
+      });
+    }
+
+    // 2. 관리 대상 폴더 목록 (프로젝트 상위 폴더 + 메모 전용 폴더)
+    const parentFolder = DriveApp.getFolderById(CONFIG.PARENT_FOLDER_ID);
+    const memoFolder = DriveApp.getFolderById(CONFIG.MEMO_PHOTO_FOLDER_ID);
+    const validParentIds = new Set([CONFIG.PARENT_FOLDER_ID, CONFIG.MEMO_PHOTO_FOLDER_ID]);
+    
+    // 프로젝트 하위 폴더 ID들도 유효 부모 목록에 추가
+    const projectFolders = parentFolder.getFolders();
+    while (projectFolders.hasNext()) {
+      validParentIds.add(projectFolders.next().getId());
+    }
+    
+    // 3. 모든 파일 순회 (ContinuationToken을 통한 이어달리기)
+    let iterator;
+    if (continuationToken) {
+      iterator = DriveApp.continueFileIterator(continuationToken);
+    } else {
+      // [최적화] 전체 드라이브를 뒤지는 대신, 관리 대상 폴더 내의 이미지 파일만 검색하도록 쿼리 생성
+      const folderQueries = Array.from(validParentIds).map(id => `'${id}' in parents`).join(' or ');
+      iterator = DriveApp.searchFiles(`(${folderQueries}) and mimeType contains 'image/'`);
+    }
+
+    let deletedCount = 0;
+    while (iterator.hasNext()) {
+      if (new Date().getTime() - startTime > TIME_LIMIT) {
+        return { 
+          success: true, 
+          finished: false, 
+          continuationToken: iterator.getContinuationToken(), 
+          deletedCount: deletedCount
+        };
+      }
+      
+      const file = iterator.next();
+      const fid = file.getId();
+      
+      // DB에 없는 ID라면 삭제 (휴지통)
+      if (!validIds.has(fid)) {
+        file.setTrashed(true);
+        deletedCount++;
+      }
+    }
+    
+    return { success: true, finished: true, deletedCount: deletedCount };
+  } catch (error) {
+    return { success: false, error: '정리 오류: ' + error.toString() };
+  }
+}
+
+function exportToCSV(projectId) {
+  try {
+    const data = callSupabase(`photos?cad_project_id=eq.${projectId}&select=file_name,file_url`, 'get');
+    let csv = '\uFEFFphoto_filename,photo_url\n';
+    if (Array.isArray(data)) data.forEach(row => { csv += `"${row.file_name}","${row.file_url}"\n`; });
+    return { success: true, csv: csv, fileName: `photos.csv` };
+  } catch (error) { return { success: false, error: 'CSV 오류: ' + error.toString() }; }
+}
+
+// [CAD 관리]
+function getCadProjects() {
+  const data = callSupabase('cad_projects?select=*&order=created_at.desc', 'get');
+  if (!Array.isArray(data)) return { success: true, projects: [] };
+  return { success: true, projects: data };
+}
+
+function createCadProject(name) {
+  try {
+    const res = callSupabase('cad_projects', 'post', { name: name });
+    if (Array.isArray(res) && res.length > 0) return { success: true, message: 'CAD 프로젝트 생성 완료', id: res[0].id };
+    return { success: true, message: 'CAD 프로젝트 생성 완료 (ID 확인 불가)' };
+  } catch (e) { return { success: false, error: e.toString() }; }
+}
+
+function renameCadProject(id, newName) {
+  try {
+    callSupabase(`cad_projects?id=eq.${id}`, 'patch', { name: newName });
+    return { success: true, message: '이름 변경 완료' };
+  } catch (e) { return { success: false, error: e.toString() }; }
+}
+
+function deleteCadProject(id) {
+  try {
+    callSupabase(`cad_projects?id=eq.${id}`, 'delete');
+    return { success: true, message: '프로젝트 삭제 완료' };
+  } catch (e) { return { success: false, error: e.toString() }; }
+}
+
+function getCadObjects(projectId) {
+  try {
+    const data = callSupabase(`cad_objects?project_id=eq.${projectId}&select=*&order=id.asc`, 'get');
+    if (!Array.isArray(data)) return { success: true, objects: [] };
+    return { success: true, objects: data };
+  } catch (e) { return { success: false, error: e.toString() }; }
+}
+
+function uploadCadObjects(projectId, data) {
+  try {
+    const objects = typeof data === 'string' ? JSON.parse(data) : data;
+    if (!Array.isArray(objects) || objects.length === 0) return { success: false, error: '데이터가 없습니다.' };
+
+    const payload = objects.map(obj => {
+      let geomStr = obj.wkt;
+      let x = obj.x ? parseFloat(obj.x) : null;
+      let y = obj.y ? parseFloat(obj.y) : null;
+      if (!geomStr && x !== null && y !== null) geomStr = `POINT(${x} ${y})`;
+      if (geomStr && !geomStr.startsWith('SRID=')) geomStr = `SRID=4326;${geomStr}`;
+
+      return {
+        project_id: projectId,
+        handle: obj.handle,
+        layer: obj.layer,
+        block_name: obj.block_name,
+        text_content: obj.text,
+        x_coord: x,
+        y_coord: y,
+        rotation: obj.rotation ? parseFloat(obj.rotation) : null,
+        geom: geomStr,
+        created_at: new Date().toISOString()
+      };
+    });
+
+    const headers = { 'Prefer': 'resolution=merge-duplicates' };
+    callSupabase('cad_objects', 'post', payload, headers);
+    return { success: true, message: `${objects.length}개 객체 저장 완료` };
+  } catch (error) { return { success: false, error: 'CAD 업로드 오류: ' + error.toString() }; }
+}
+
+function deleteCadObjects(ids) {
+  try {
+    callSupabase(`cad_objects?id=in.(${ids})`, 'delete');
+    return { success: true, message: '선택한 객체가 삭제되었습니다.' };
+  } catch (e) { return { success: false, error: e.toString() }; }
+}
+
+function deleteProjectCadObjects(projectId) {
+  try {
+    callSupabase(`cad_objects?project_id=eq.${projectId}`, 'delete');
+    return { success: true, message: '프로젝트 데이터 초기화 완료' };
+  } catch (e) { return { success: false, error: e.toString() }; }
+}
+
+// [SVG 관리]
+function getSvgs(folderId) {
+  try {
+    const data = callSupabase('svg_library?select=block_name,file_id', 'get');
+    if (!Array.isArray(data)) return { success: true, svgs: [] };
+    const svgs = data.map(row => ({ fileName: row.block_name + '.svg', fileId: row.file_id }));
+    return { success: true, svgs: svgs };
+  } catch (e) { return { success: false, error: 'SVG 목록 조회 실패: ' + e.toString() }; }
+}
+
+function uploadSvg(folderId, fileData, fileName, skipDb) {
+  try {
+    const shouldSkipDb = String(skipDb).toLowerCase() === 'true';
+    const contentType = 'image/svg+xml';
+    const base64Data = fileData.split(',')[1];
+    const bytes = Utilities.base64Decode(base64Data);
+    const blob = Utilities.newBlob(bytes, contentType, fileName);
+    const folder = DriveApp.getFolderById(folderId);
+    const file = folder.createFile(blob);
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    
+    const fileId = file.getId();
+    const blockName = fileName.replace('.svg', '');
+    const publicUrl = `https://lh3.googleusercontent.com/d/${fileId}`;
+    
+    if (!shouldSkipDb) {
+      const payload = [{ block_name: blockName, file_id: fileId, file_url: publicUrl, updated_at: new Date().toISOString() }];
+      const headers = { 'Prefer': 'resolution=merge-duplicates' };
+      callSupabase('svg_library', 'post', payload, headers);
+    }
+    return { success: true, message: 'SVG 업로드 완료', fileId: fileId, fileUrl: publicUrl };
+  } catch (e) { return { success: false, error: 'SVG 업로드 실패: ' + e.toString() }; }
+}
+
+function syncSvgLibrary(continuationToken) {
+  try {
+    const startTime = new Date().getTime();
+    const TIME_LIMIT = 210 * 1000;
+
+    const dbData = callSupabase('svg_library?select=block_name,file_id', 'get');
+    const dbMap = new Map();
+    if (Array.isArray(dbData)) dbData.forEach(row => dbMap.set(row.block_name, row.file_id));
+
+    const folder = DriveApp.getFolderById(CONFIG.SVG_FOLDER_ID);
+    const iterator = continuationToken ? DriveApp.continueFileIterator(continuationToken) : folder.getFiles();
+    const payloadMap = new Map();
+    let processedCount = 0;
+    
+    while (iterator.hasNext()) {
+      if (new Date().getTime() - startTime > TIME_LIMIT) {
+        if (payloadMap.size > 0) {
+          const headers = { 'Prefer': 'resolution=merge-duplicates' };
+          callSupabase('svg_library', 'post', Array.from(payloadMap.values()), headers);
+        }
+        return { success: true, finished: false, continuationToken: iterator.getContinuationToken(), processedCount: processedCount, message: `동기화 진행 중... (${processedCount}개 처리)` };
+      }
+
+      const file = iterator.next();
+      const fileName = file.getName();
+      
+      if (fileName.toLowerCase().endsWith('.svg')) {
+        const blockName = fileName.substring(0, fileName.lastIndexOf('.'));
+        const fileId = file.getId();
+        
+        if (!dbMap.has(blockName) || dbMap.get(blockName) !== fileId) {
+          file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+          const publicUrl = `https://lh3.googleusercontent.com/d/${fileId}`;
+          payloadMap.set(blockName, { block_name: blockName, file_id: fileId, file_url: publicUrl, updated_at: new Date().toISOString() });
+          processedCount++;
+        }
+      }
+    }
+
+    if (payloadMap.size > 0) {
+      const headers = { 'Prefer': 'resolution=merge-duplicates' };
+      callSupabase('svg_library', 'post', Array.from(payloadMap.values()), headers);
+    }
+    return { success: true, finished: true, processedCount: processedCount, message: `SVG 동기화 완료 (${processedCount}개 처리)` };
+  } catch (e) { return { success: false, error: 'SVG 동기화 오류: ' + e.toString() }; }
+}
+
+function getSupabaseConfig() {
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const url = props.getProperty('SUPABASE_URL');
+    const key = props.getProperty('SUPABASE_KEY');
+    const vworldKey = props.getProperty('VWORLD_API_KEY');
+    const adminUser = props.getProperty('AD_USER');
+    if (!url || !key) return { success: false, error: 'Supabase 설정이 스크립트 속성에 없습니다.' };
+    return { success: true, url: url, key: key, vworldKey: vworldKey, adminUser: adminUser };
+  } catch (e) { return { success: false, error: e.toString() }; }
+}
+
+function callSupabase(endpoint, method, payload, extraHeaders) {
+  try {
+    const baseUrl = PropertiesService.getScriptProperties().getProperty('SUPABASE_URL');
+    const apiKey = PropertiesService.getScriptProperties().getProperty('SUPABASE_KEY');
+    if (!baseUrl || !apiKey) throw new Error('Supabase 설정이 누락되었습니다.');
+
+    const url = `${baseUrl}/rest/v1/${endpoint}`;
+    const options = {
+      method: method || 'get',
+      headers: { 'apikey': apiKey, 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json', 'Prefer': 'return=representation' },
+      muteHttpExceptions: true
+    };
+    if (extraHeaders) Object.assign(options.headers, extraHeaders);
+    if (payload) options.payload = JSON.stringify(payload);
+
+    const response = UrlFetchApp.fetch(url, options);
+    const responseCode = response.getResponseCode();
+    const responseBody = response.getContentText();
+
+    if (responseCode >= 200 && responseCode < 300) {
+      return responseBody ? JSON.parse(responseBody) : { success: true };
+    } else {
+      throw new Error(`Supabase Error (${responseCode}): ${responseBody}`);
+    }
+  } catch (e) {
+    Logger.log('Supabase Call Error: ' + e.toString());
+    throw e;
+  }
+}
+
+function triggerGitHubAction(projectId) {
+  const props = PropertiesService.getScriptProperties();
+  const token = props.getProperty('GITHUB_TOKEN');
+  const owner = props.getProperty('GITHUB_REPO_OWNER');
+  const repo = props.getProperty('GITHUB_REPO_NAME');
+
+  if (!token || !owner || !repo) return { success: false, error: 'GitHub 설정이 스크립트 속성에 없습니다.' };
+
+  const url = `https://api.github.com/repos/${owner}/${repo}/dispatches`;
+  const payload = { event_type: "convert_cad", client_payload: { project_id: projectId } };
+  const options = { method: "post", headers: { "Authorization": `Bearer ${token}`, "Accept": "application/vnd.github.v3+json" }, payload: JSON.stringify(payload), muteHttpExceptions: true };
+
+  try {
+    const res = UrlFetchApp.fetch(url, options);
+    if (res.getResponseCode() === 204) return { success: true, message: 'GitHub Action이 시작되었습니다.' };
+    else return { success: false, error: `GitHub 요청 실패 (${res.getResponseCode()}): ${res.getContentText()}` };
+  } catch (e) { return { success: false, error: 'GitHub 통신 오류: ' + e.toString() }; }
+}
+
+// ==========================================
+// [메모 관리] 구글 드라이브/시트 연동 함수
+// ==========================================
+
+function uploadToDrive(fileName, fileData, mimeType) {
+  try {
+    const folder = DriveApp.getFolderById(CONFIG.MEMO_PHOTO_FOLDER_ID);
+    const decoded = Utilities.base64Decode(fileData);
+    const blob = Utilities.newBlob(decoded, mimeType, fileName);
+    const file = folder.createFile(blob);
+    
+    // [수정] 공유 권한 설정 시 발생할 수 있는 '액세스 거부' 에러 격리
+    // 조직의 보안 정책에 따라 public 공유가 막혀 있어도 파일 자체는 생성되었으므로 URL을 반환하도록 함
+    try {
+      file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    } catch (e) {
+      // 공유 설정 실패해도 무시하고 진행 (파일 ID는 이미 생성됨)
+      Logger.log("공유 권한 설정 실패 (무시됨): " + e.toString());
+    }
+    
+    const fileId = file.getId();
+    // [수정] URL에 파일명을 포함시켜 클라이언트에서 확장자 판별이 가능하도록 함
+    const url = "https://drive.google.com/uc?export=view&id=" + fileId + "&name=" + encodeURIComponent(fileName);
+    
+    return { success: true, url: url, fileId: fileId };
+  } catch (e) { return { success: false, error: '드라이브 업로드 실패: ' + e.toString() }; }
+}
+
+// [수정] 오래된 메모 아카이빙 (동기화 및 정리)
+// 1. 중복 기재 방지 (ID 체크)
+// 2. Supabase에서 삭제된 메모(1년 이내)는 시트에서도 삭제
+// 3. 1년 지난 메모는 Supabase에서 삭제 (시트에는 보존)
+// 4. [추가] 새로운 컬럼(is_survey, job_name, tm_x, tm_y, chainage) 동기화
+function archiveOldMemos() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) return;
+
+  const startTime = new Date().getTime();
+  const TIME_LIMIT = 280 * 1000;
+
+  try {
+    Logger.log("[매일 동기화 및 정리 시작]");
+
+    const ss = SpreadsheetApp.openById(CONFIG.MEMO_ARCHIVE_SHEET_ID);
+    let sheet = ss.getSheetByName(CONFIG.MEMO_ARCHIVE_SHEET_NAME);
+    
+    if (!sheet) {
+      sheet = ss.insertSheet(CONFIG.MEMO_ARCHIVE_SHEET_NAME);
+      // [수정] 헤더에 새 컬럼 추가
+      sheet.appendRow(['id', 'project_id', 'content', 'username', 'created_at', 'updated_at', 'is_public', 'image_url', 'lon', 'lat', 'is_survey', 'job_name', 'tm_x', 'tm_y', 'chainage']);
+    }
+
+    // 1. 시트 데이터 로드 (ID 및 생성일 매핑)
+    const lastRow = sheet.getLastRow();
+    const sheetMap = new Map(); // ID -> {row: index, date: Date}
+    let maxDate = new Date(0);
+
+    if (lastRow > 1) {
+      const data = sheet.getRange(2, 1, lastRow - 1, 5).getValues(); // A~E열 (ID ~ created_at)
+      for(let i=0; i<data.length; i++) {
+        const id = String(data[i][0]);
+        const dateVal = data[i][4];
+        const date = new Date(dateVal);
+        sheetMap.set(id, {row: i + 2, date: date}); // row는 1-based index
+        if(date > maxDate) maxDate = date;
+      }
+    }
+
+    // 2. [Sync Deletion] 최근 1년 이내 데이터 중 Supabase에서 삭제된 항목 시트에서 제거
+    const oneYearAgo = new Date();
+    oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+    
+    // 1년 이내의 시트 데이터 ID 목록 추출
+    const recentSheetIds = [];
+    for (const [id, info] of sheetMap) {
+      if (info.date > oneYearAgo) recentSheetIds.push(id);
+    }
+
+    if (recentSheetIds.length > 0) {
+      // Supabase에 존재하는 1년 이내 데이터 ID 조회
+      const activeIds = new Set();
+      let page = 0;
+      while(true) {
+        const res = callSupabase(`memos?select=id&created_at=gt.${oneYearAgo.toISOString()}&offset=${page*1000}&limit=1000`, 'get');
+        if(!res || res.length === 0) break;
+        res.forEach(r => activeIds.add(r.id));
+        if(res.length < 1000) break;
+        page++;
+      }
+
+      // 시트에는 있는데 Supabase에는 없는 ID 찾기 (삭제 대상)
+      const rowsToDelete = [];
+      for (const id of recentSheetIds) {
+        if (!activeIds.has(id)) {
+          rowsToDelete.push(sheetMap.get(id).row);
+        }
+      }
+
+      // 행 삭제 (인덱스 꼬임 방지를 위해 내림차순 정렬 후 삭제)
+      if (rowsToDelete.length > 0) {
+        rowsToDelete.sort((a, b) => b - a);
+        rowsToDelete.forEach(r => sheet.deleteRow(r));
+        Logger.log(`${rowsToDelete.length}개 삭제된 메모 시트에서 제거 완료.`);
+      }
+    }
+
+    // 3. [Backup] 신규 데이터 백업 (중복 방지 적용)
+    // 마지막 백업 시점 이후 데이터 조회
+    let lastSyncedTime = maxDate.toISOString();
+    if (maxDate.getTime() === 0) lastSyncedTime = '1970-01-01T00:00:00.000Z';
+
+    let syncCount = 0;
+    while (true) {
+      if (new Date().getTime() - startTime > TIME_LIMIT / 2) break;
+
+      const newMemos = callSupabase(`memos?created_at=gt.${lastSyncedTime}&order=created_at.asc&limit=50`, 'get');
+      if (!Array.isArray(newMemos) || newMemos.length === 0) break;
+
+      const rows = [];
+      newMemos.forEach(m => {
+        // [중복 방지] 이미 시트에 있는 ID는 건너뜀
+        if (!sheetMap.has(m.id)) {
+          // [수정] 새 컬럼 데이터 추가
+          rows.push([
+            m.id, m.project_id, m.content, m.username, m.created_at,
+            m.updated_at, m.is_public, m.image_url, m.lon, m.lat,
+            m.is_survey, m.job_name, m.tm_x, m.tm_y, m.chainage
+          ]);
+        }
+      });
+
+      if (rows.length > 0) {
+        sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+        syncCount += rows.length;
+      }
+      
+      lastSyncedTime = newMemos[newMemos.length - 1].created_at;
+    }
+    Logger.log(`${syncCount}개 신규 메모 백업 완료.`);
+
+    // 4. [Prune] 1년 지난 데이터 DB 삭제 (시트에는 남김)
+    const dateStr = oneYearAgo.toISOString();
+    let deleteCount = 0;
+    while (true) {
+      if (new Date().getTime() - startTime > TIME_LIMIT) break;
+
+      const oldMemos = callSupabase(`memos?created_at=lt.${dateStr}&limit=50&order=created_at.asc`, 'get');
+      if (!Array.isArray(oldMemos) || oldMemos.length === 0) break;
+
+      const idsToDelete = oldMemos.map(m => m.id).join(',');
+      callSupabase(`memos?id=in.(${idsToDelete})`, 'delete');
+      deleteCount += oldMemos.length;
+    }
+    Logger.log(`${deleteCount}개 오래된 메모 DB 삭제 완료.`);
+
+    if (new Date().getTime() - startTime < TIME_LIMIT) cleanupOrphanedPhotos();
+
+  } catch (e) {
+    Logger.log("작업 오류: " + e.toString());
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function cleanupOrphanedPhotos() {
+  Logger.log("고아 사진 정리 시작...");
+  const startTime = new Date().getTime();
+  const TIME_LIMIT = 200 * 1000;
+
+  try {
+    const validIds = new Set();
+    let page = 0;
+    const pageSize = 1000;
+    while (true) {
+      const data = callSupabase(`memos?select=image_url&image_url=not.is.null&offset=${page * pageSize}&limit=${pageSize}`, 'get');
+      if (!data || data.length === 0) break;
+      data.forEach(row => {
+        if (row.image_url) {
+          const urls = row.image_url.split(',');
+          urls.forEach(url => {
+            const id = extractFileIdFromUrl(url.trim());
+            if (id) validIds.add(id);
+          });
+        }
+      });
+      if (data.length < pageSize) break;
+      page++;
+    }
+
+    const ss = SpreadsheetApp.openById(CONFIG.MEMO_ARCHIVE_SHEET_ID);
+    const sheet = ss.getSheetByName(CONFIG.MEMO_ARCHIVE_SHEET_NAME);
+    if (sheet) {
+      const lastRow = sheet.getLastRow();
+      if (lastRow > 1) {
+        const data = sheet.getRange(2, 8, lastRow - 1, 1).getValues();
+        data.forEach(row => { // row[0] is image_url
+          if (row[0]) {
+            const urls = String(row[0]).split(',');
+            urls.forEach(url => {
+              const id = extractFileIdFromUrl(url.trim());
+              if (id) validIds.add(id);
+            });
+          }
+        });
+      }
+    }
+
+    const folder = DriveApp.getFolderById(CONFIG.MEMO_PHOTO_FOLDER_ID);
+    const files = folder.getFiles();
+    let deletedCount = 0;
+
+    while (files.hasNext()) {
+      if (new Date().getTime() - startTime > TIME_LIMIT) break;
+      const file = files.next();
+      if (!validIds.has(file.getId())) {
+        try { file.setTrashed(true); deletedCount++; } catch (e) {}
+      }
+    }
+    Logger.log(`고아 사진 정리 완료: ${deletedCount}개 삭제됨`);
+  } catch (e) { Logger.log("사진 정리 오류: " + e.toString()); }
+}
+
+function extractFileIdFromUrl(url) {
+  if (!url) return null;
+  const match = url.match(/(?:id=|\/d\/|d\/)([a-zA-Z0-9_-]{25,})/);
+  return match ? match[1] : null;
+}

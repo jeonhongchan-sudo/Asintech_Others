@@ -1,0 +1,336 @@
+(vl-load-com)
+
+;;; ==========================================================================
+;;; [HSB_KR] 하수물받이(인렛) 속성 관리 및 데이터 동기화 시스템
+;;; 지원 환경: AutoCAD Map 3D / Civil 3D
+;;; 
+;;; [명령어 가이드]
+;;; 1. HSB  : 물받이 속성 입력 및 텍스트 생성
+;;; 2. HSBU : 특성창에서 수정한 OD 데이터를 도면 텍스트에 일괄 반영
+;;; 3. HSBC : OD 데이터와 도면 텍스트의 일치 여부 검사
+;;; 4. HSBM : 속성이 입력되지 않은 누락 물받이 탐색
+;;; ==========================================================================
+
+;; XData 앱 등록
+(if (not (tblsearch "APPID" "HSB_LINK")) (regapp "HSB_LINK"))
+
+;; 전역 변수 설정 (마지막 입력값 유지)
+(if (not *hsb_settings*)
+  (setq *hsb_settings*
+    (list
+      '("id_num" . "1001") '("sulchi" . "2026") '("yongdo" . "0") '("b_form" . "1")
+      '("b_dia" . "400") '("b_w" . "400") '("b_l" . "600") '("b_h" . "1.0")
+      '("c_form" . "1") '("c_dia" . "400") '("c_w" . "400") '("c_l" . "600")
+      '("c_mat" . "0") '("p_mat" . "0") '("p_dia" . "200") '("status" . "정상")
+    )
+  )
+)
+
+(defun hsb:get_v (k / val)
+  (setq val (cdr (assoc k *hsb_settings*)))
+  (if (null val) "" (vl-princ-to-string val))
+)
+
+(defun hsb:set_v (k v)
+  (if (assoc k *hsb_settings*)
+    (setq *hsb_settings* (subst (cons k v) (assoc k *hsb_settings*) *hsb_settings*))
+    (setq *hsb_settings* (cons (cons k v) *hsb_settings*))
+  )
+)
+
+;; Object Data 테이블 정의
+(defun hsb:check_table (/ tName tDef)
+  (setq tName "HSB_DATA")
+  (if (null ade_odtablelist) 
+    (progn (alert "오류: Autodesk Map 3D 기능이 로드되지 않았습니다.") nil)
+    (if (member (strcase tName) (mapcar 'strcase (ade_odtablelist))) t
+      (progn
+        (setq tDef (list (cons "TableName" tName) (cons "TableDesc" "하수물받이 데이터")
+          (cons "Columns" (list
+            (list (cons "ColName" "ORG_ID") (cons "ColDesc" "관리번호") (cons "ColType" "Character") (cons "DefaultVal" ""))
+            (list (cons "ColName" "PURP")   (cons "ColDesc" "용도")     (cons "ColType" "Character") (cons "DefaultVal" ""))
+            (list (cons "ColName" "YEAR")   (cons "ColDesc" "설치연도") (cons "ColType" "Character") (cons "DefaultVal" "2026"))
+            (list (cons "ColName" "FORM")   (cons "ColDesc" "형태")     (cons "ColType" "Character") (cons "DefaultVal" ""))
+            (list (cons "ColName" "B_W")    (cons "ColDesc" "본체규격1") (cons "ColType" "Real")      (cons "DefaultVal" 0.0))
+            (list (cons "ColName" "B_L")    (cons "ColDesc" "본체규격2") (cons "ColType" "Real")      (cons "DefaultVal" 0.0))
+            (list (cons "ColName" "HEIGHT") (cons "ColDesc" "총 높이")   (cons "ColType" "Real")      (cons "DefaultVal" 0.0))
+            (list (cons "ColName" "C_FORM") (cons "ColDesc" "뚜껑형태") (cons "ColType" "Character") (cons "DefaultVal" ""))
+            (list (cons "ColName" "C_W")    (cons "ColDesc" "뚜껑규격1") (cons "ColType" "Real")      (cons "DefaultVal" 0.0))
+            (list (cons "ColName" "C_L")    (cons "ColDesc" "뚜껑규격2") (cons "ColType" "Real")      (cons "DefaultVal" 0.0))
+            (list (cons "ColName" "MAT_COV") (cons "ColDesc" "뚜껑재질") (cons "ColType" "Character") (cons "DefaultVal" ""))
+            (list (cons "ColName" "P_MAT")  (cons "ColDesc" "연결관재질") (cons "ColType" "Character") (cons "DefaultVal" ""))
+            (list (cons "ColName" "P_DIA")  (cons "ColDesc" "연결관경") (cons "ColType" "Character") (cons "DefaultVal" ""))
+            (list (cons "ColName" "ANG")    (cons "ColDesc" "방향각")   (cons "ColType" "Character") (cons "DefaultVal" ""))
+            (list (cons "ColName" "STATUS")  (cons "ColDesc" "이상상태") (cons "ColType" "Character") (cons "DefaultVal" ""))
+            (list (cons "ColName" "SPEC")   (cons "ColDesc" "전체제원") (cons "ColType" "Character") (cons "DefaultVal" ""))
+          ))))
+        (if (ade_oddefinetab tDef) t (progn (alert "테이블 생성 실패!") nil))
+      )
+    )
+  )
+)
+
+;; Object Data 기록 헬퍼 함수 (맨홀 리습 스타일)
+(defun hsb:attach_od (en m_id y_txt year bf_txt b_w b_l b_h cf_txt c_w c_l mat_txt p_mat_txt p_dia ang status total_txt)
+  (if (and ade_odrecordqty (hsb:check_table))
+    (progn
+      (if (= (ade_odrecordqty en "HSB_DATA") 0) (ade_odaddrecord en "HSB_DATA"))
+      (ade_odsetfield en "HSB_DATA" "ORG_ID"  0 m_id)
+      (ade_odsetfield en "HSB_DATA" "PURP"    0 y_txt)
+      (ade_odsetfield en "HSB_DATA" "YEAR"    0 year)
+      (ade_odsetfield en "HSB_DATA" "FORM"    0 bf_txt)
+      (ade_odsetfield en "HSB_DATA" "B_W"     0 (atof b_w))
+      (ade_odsetfield en "HSB_DATA" "B_L"     0 (atof b_l))
+      (ade_odsetfield en "HSB_DATA" "HEIGHT"  0 (atof b_h))
+      (ade_odsetfield en "HSB_DATA" "C_FORM"  0 cf_txt)
+      (ade_odsetfield en "HSB_DATA" "C_W"     0 (atof c_w))
+      (ade_odsetfield en "HSB_DATA" "C_L"     0 (atof c_l))
+      (ade_odsetfield en "HSB_DATA" "MAT_COV" 0 mat_txt)
+      (ade_odsetfield en "HSB_DATA" "P_MAT"   0 p_mat_txt)
+      (ade_odsetfield en "HSB_DATA" "P_DIA"   0 p_dia)
+      (ade_odsetfield en "HSB_DATA" "ANG"     0 ang)
+      (ade_odsetfield en "HSB_DATA" "STATUS"  0 status)
+      (ade_odsetfield en "HSB_DATA" "SPEC"    0 total_txt)
+      (entupd en)
+    )
+  )
+)
+
+;; OD 데이터 동기화 헬퍼 함수 (SHP 변환 시 문자열 속성 유지용)
+(defun hsb:sync_od (src_en dest_en / tName cols fld val)
+  (setq tName "HSB_DATA")
+  (if (and src_en dest_en (member (strcase tName) (mapcar 'strcase (ade_odtablelist))))
+    (progn
+      (if (= (ade_odrecordqty dest_en tName) 0) (ade_odaddrecord dest_en tName))
+      (setq cols '("ORG_ID" "PURP" "YEAR" "FORM" "B_W" "B_L" "HEIGHT" "C_FORM" "C_W" "C_L" "MAT_COV" "P_MAT" "P_DIA" "ANG" "STATUS" "SPEC"))
+      (foreach fld cols
+        (setq val (ade_odgetfield src_en tName fld 0))
+        (ade_odsetfield dest_en tName fld 0 val)
+      )
+      (entupd dest_en)
+    )
+  )
+)
+
+;; 제원 문자열 생성용 헬퍼 함수
+(defun hsb:get-jewon-string (en / _f)
+  (defun _f (f / v) 
+    (setq v (ade_odgetfield en "HSB_DATA" f 0))
+    (cond 
+      ((numberp v) (if (equal v 0.0 0.001) "" (rtos v 2 0)))
+      ((null v) "")
+      (t (vl-princ-to-string v))
+    )
+  )
+  (defun _n (f) 
+    (setq v (ade_odgetfield en "HSB_DATA" f 0))
+    (if (numberp v) (rtos v 2 2) (vl-princ-to-string v))
+  )
+  (setq bf (_f "FORM") cf (_f "C_FORM") stat (_f "STATUS"))
+  (strcat 
+    (_f "ORG_ID") "/" (_f "PURP") "/" bf "/"
+    (if (= bf "원형") (strcat (_f "B_W") "//") (strcat "/" (_f "B_W") "/" (_f "B_L")))
+    "/" (_n "HEIGHT") "/" cf "/" (_f "MAT_COV") "/" (if (= stat "정상") "" (strcat stat "/")) (_f "ANG") "%%d/"
+    (if (= cf "원형") (strcat (_f "C_W") "//") (strcat "/" (_f "C_W") "/" (_f "C_L")))
+    "/관:" (_f "P_MAT") "/" (_f "P_DIA")
+  )
+)
+
+;; 메인 명령어: HSB
+(defun c:HSB (/ s_data s_list dcl_id dclpath f res m_id sulchi_val y_idx bf_idx cf_idx mat_idx p_mat_idx b_dia b_w b_l b_h c_dia c_w c_l p_dia ang y_txt bf_txt cf_txt mat_txt p_mat_txt total_txt old_la old_os exist_id_qty i found text_ent xdata lay ent x_data_list old_txt_h old_txt_en status_txt)
+  (if (not (hsb:check_table)) (exit))
+  (setq old_la (getvar "clayer") old_os (getvar "osmode"))
+  (setq s_data (car (entsel "\n[HSB] 속성을 입력할 물받이 블록 선택: ")))
+  (if (null s_data) (progn (princ "\n[취소] 객체가 선택되지 않았습니다.") (exit)))
+  (setq s_list (entget s_data))
+  (setq ang (rtos (* (cdr (assoc 50 s_list)) (/ 180.0 pi)) 2 0))
+  
+  ;; DCL 동적 생성
+  (setq dclpath (strcat (getenv "TEMP") "\\hsb_q2.dcl"))
+  (setq f (open dclpath "w"))
+  (write-line "hsb_q2 : dialog { label = \"하수물받이 속성 입력 (HSB)\"; width = 50;" f)
+  (write-line " : edit_box { label = \"관리번호\"; key = \"id_num\"; }" f)
+  (write-line " : edit_box { label = \"설치연도\"; key = \"sulchi\"; }" f)
+  (write-line " : boxed_radio_row { label = \"용도\"; key = \"yongdo\";" f)
+  (write-line "  : radio_button { label = \"우수\"; key = \"y0\"; } : radio_button { label = \"오수\"; key = \"y1\"; } }" f)
+  (write-line " : row {" f)
+  (write-line "  : boxed_column { label = \"받이 형태\";" f)
+  (write-line "   : radio_button { label = \"원형\"; key = \"bf0\"; } : radio_button { label = \"각형\"; key = \"bf1\"; }" f)
+  (write-line "   : edit_box { label = \"내경/가로\"; key = \"b_w\"; } : edit_box { label = \"세로\"; key = \"b_l\"; } : edit_box { label = \"깊이\"; key = \"b_h\"; } }" f)
+  (write-line "  : boxed_column { label = \"뚜껑 형태\";" f)
+  (write-line "   : radio_button { label = \"원형\"; key = \"cf0\"; } : radio_button { label = \"각형\"; key = \"cf1\"; }" f)
+  (write-line "   : edit_box { label = \"구경/가로\"; key = \"c_w\"; } : edit_box { label = \"세로\"; key = \"c_l\"; }" f)
+  (write-line "   : popup_list { label = \"재질\"; key = \"c_mat\"; } } }" f)
+  (write-line " : boxed_row { label = \"연결관 정보\";" f)
+  (write-line "  : popup_list { label = \"재질\"; key = \"p_mat\"; width = 10; } : edit_box { label = \"관경\"; key = \"p_dia\"; } " f)
+  (write-line "  : edit_box { label = \"이상상태\"; key = \"status\"; } }" f)
+  (write-line " ok_cancel; }" f)
+  (close f)
+
+  (setq dcl_id (load_dialog dclpath))
+  (if (not (new_dialog "hsb_q2" dcl_id)) (exit))
+
+  ;; 레이어에 따른 용도(우수/오수) 자동 판별 및 비활성화 로직
+  (setq lay (strcase (cdr (assoc 8 s_list))))
+  (setq y_idx (cond 
+                ((wcmatch lay "*SB1020*") "1") ; 오수
+                ((wcmatch lay "*SB102*") "0")  ; 우수
+                (t (hsb:get_v "yongdo"))
+              ))
+
+  (setq exist_id_qty (ade_odrecordqty s_data "HSB_DATA"))
+  (if (> exist_id_qty 0)
+    (set_tile "id_num" (vl-princ-to-string (ade_odgetfield s_data "HSB_DATA" "ORG_ID" 0)))
+    (set_tile "id_num" "받이관리번호")
+  )
+  (set_tile "sulchi" (hsb:get_v "sulchi"))
+  (set_tile "status" (hsb:get_v "status"))
+  (set_tile (strcat "y" y_idx) "1")
+  ;; 사용자 수정 방지를 위해 용도 선택창 비활성화
+  (mode_tile "y0" 1)
+  (mode_tile "y1" 1)
+
+  (set_tile (strcat "bf" (hsb:get_v "b_form")) "1")
+  (set_tile (strcat "cf" (hsb:get_v "c_form")) "1")
+  (set_tile "b_w" (hsb:get_v "b_w")) (set_tile "b_l" (hsb:get_v "b_l")) (set_tile "b_h" (hsb:get_v "b_h"))
+  (set_tile "c_w" (hsb:get_v "c_w")) (set_tile "c_l" (hsb:get_v "c_l")) (set_tile "p_dia" (hsb:get_v "p_dia"))
+  (start_list "c_mat") (mapcar 'add_list '("SG" "PE" "주철" "철판" "기타")) (end_list)
+  (set_tile "c_mat" (hsb:get_v "c_mat"))
+  (start_list "p_mat") (mapcar 'add_list '("PE" "PVC" "흄관")) (end_list)
+  (set_tile "p_mat" (hsb:get_v "p_mat"))
+
+  (defun update_hsb_ui ()
+    (mode_tile "b_l" (if (= (get_tile "bf0") "1") 1 0))
+    (mode_tile "c_l" (if (= (get_tile "cf0") "1") 1 0))
+  )
+  (action_tile "bf0" "(update_hsb_ui)") (action_tile "bf1" "(update_hsb_ui)")
+  (action_tile "cf0" "(update_hsb_ui)") (action_tile "cf1" "(update_hsb_ui)")
+  (update_hsb_ui)
+
+  (action_tile "accept" (strcat 
+    "(setq m_id (get_tile \"id_num\"))"
+    "(setq sulchi_val (get_tile \"sulchi\"))"
+    "(setq y_idx (if (= (get_tile \"y0\") \"1\") \"0\" \"1\"))"
+    "(setq bf_idx (if (= (get_tile \"bf0\") \"1\") \"0\" \"1\"))"
+    "(setq cf_idx (if (= (get_tile \"cf0\") \"1\") \"0\" \"1\"))"
+    "(setq b_w (get_tile \"b_w\") b_l (get_tile \"b_l\") b_h (get_tile \"b_h\"))"
+    "(setq c_w (get_tile \"c_w\") c_l (get_tile \"c_l\") mat_idx (get_tile \"c_mat\") status_txt (get_tile \"status\"))"
+    "(setq p_mat_idx (get_tile \"p_mat\") p_dia (get_tile \"p_dia\")) (done_dialog 1)"))
+  
+  (setq res (start_dialog)) (unload_dialog dcl_id) (vl-file-delete dclpath)
+
+  (if (= res 1)
+    (progn
+      ;; 기존에 생성된 텍스트가 있다면 삭제 (중첩 방지)
+      (setq ent (entget s_data '("HSB_LINK")))
+      (if (setq x_data_list (assoc -3 ent))
+        (progn (setq old_txt_h (cdr (assoc 1005 (cdadr x_data_list)))) (setq old_txt_en (handent old_txt_h)) (if (and old_txt_en (entget old_txt_en)) (entdel old_txt_en))))
+
+      ;; 관리번호가 공란일 경우 기본값 설정
+      (if (or (null m_id) (= m_id "")) (setq m_id "받이관리번호"))
+      ;; 설치연도가 공란일 경우 기본값(2026) 설정
+      (if (or (null sulchi_val) (= sulchi_val "")) (setq sulchi_val "2026"))
+      (hsb:set_v "sulchi" sulchi_val)
+      (hsb:set_v "status" status_txt)
+
+      ;; 신규 입력시에만 자동 번호 증가 (공란이 아닐 경우만 수행)
+      (if (and (= exist_id_qty 0) (/= m_id "받이관리번호"))
+        (progn
+          (setq i 1 found nil)
+          (while (and (<= i (strlen m_id)) (not found)) (if (wcmatch (substr m_id i 1) "#") (setq found i) (setq i (1+ i))))
+          (if found (hsb:set_v "id_num" (itoa (1+ (atoi (substr m_id found))))))
+          (if (not (wcmatch (strcase m_id) "SB*")) (setq m_id (strcat "SB" m_id)))
+        )
+      )
+      (hsb:set_v "yongdo" y_idx) (hsb:set_v "b_form" bf_idx)
+      (hsb:set_v "b_w" b_w) (hsb:set_v "b_l" b_l) (hsb:set_v "b_h" b_h)
+      (hsb:set_v "c_form" cf_idx) (hsb:set_v "c_w" c_w) (hsb:set_v "c_l" c_l)
+      (hsb:set_v "c_mat" mat_idx) (hsb:set_v "p_mat" p_mat_idx) (hsb:set_v "p_dia" p_dia)
+
+      (setq y_txt (if (= y_idx "0") "우수" "오수")
+            bf_txt (if (= bf_idx "0") "원형" "각형")
+            cf_txt (if (= cf_idx "0") "원형" "각형")
+            mat_txt (nth (atoi mat_idx) '("SG" "PE" "주철" "철판" "기타"))
+            p_mat_txt (nth (atoi p_mat_idx) '("PE" "PVC" "흄관")))
+
+      (setq total_txt (strcat m_id "/" y_txt "/" bf_txt "/")) ;; 설치연도(sulchi_val)를 SPEC 문자열에서 제외
+      (if (= bf_idx "0") (setq total_txt (strcat total_txt b_w "//")) (setq total_txt (strcat total_txt "/" b_w "/" b_l)))
+      (setq total_txt (strcat total_txt "/" b_h "/" cf_txt "/" mat_txt "/" (if (= status_txt "정상") "" (strcat status_txt "/")) ang "%%d/"))
+      (if (= cf_idx "0") (setq total_txt (strcat total_txt c_w "//")) (setq total_txt (strcat total_txt "/" c_w "/" c_l)))
+      (setq total_txt (strcat total_txt "/관:" p_mat_txt "/" p_dia))
+
+      (setvar "osmode" 0)
+      (if (tblsearch "layer" (strcat (cdr (assoc 8 s_list)) "_속성"))
+          (setvar "clayer" (strcat (cdr (assoc 8 s_list)) "_속성"))
+          (command "layer" "m" (strcat (cdr (assoc 8 s_list)) "_속성") ""))
+      
+      (command "text" (cdr (assoc 10 s_list)) "0.3" "0" total_txt)
+      (setq text_ent (entlast))
+
+      ;; 블록과 텍스트 양쪽에 OD 기록
+      (hsb:attach_od s_data m_id y_txt sulchi_val bf_txt b_w b_l b_h cf_txt c_w c_l mat_txt p_mat_txt p_dia ang status_txt total_txt)
+      (hsb:attach_od text_ent m_id y_txt sulchi_val bf_txt b_w b_l b_h cf_txt c_w c_l mat_txt p_mat_txt p_dia ang status_txt total_txt)
+
+      (setq xdata (list (list -3 (list "HSB_LINK" (cons 1005 (cdr (assoc 5 (entget text_ent))))))))
+      (entmod (append (entget s_data) xdata))
+      (setq xdata (list (list -3 (list "HSB_LINK" (cons 1005 (cdr (assoc 5 (entget s_data))))))))
+      (entmod (append (entget text_ent) xdata))
+      (setvar "clayer" old_la) (setvar "osmode" old_os)
+      (princ (strcat "\n[성공] 물받이(" m_id ") 속성 입력 완료."))
+    )
+  )
+  (princ)
+)
+
+;; 명령어: HSBU (Update)
+(defun c:HSBU (/ ss i en ent xdata txt_h txt_en new_str)
+  (princ "\n[HSBU] 데이터 동기화: OD 데이터를 도면 텍스트에 일괄 반영합니다.")
+  (setq ss (ssget '((0 . "INSERT") (-3 ("HSB_LINK")))))
+  (if (null ss) (setq ss (ssget "X" '((0 . "INSERT") (-3 ("HSB_LINK"))))))
+  (if ss
+    (progn
+      (setq i 0)
+      (repeat (sslength ss)
+        (setq en (ssname ss i))
+        (setq ent (entget en '("HSB_LINK")))
+        (if (setq xdata (assoc -3 ent))
+          (progn
+            (setq txt_h (cdr (assoc 1005 (cdadr xdata))))
+            (setq txt_en (handent txt_h))
+            (if (and txt_en (setq txt_elist (entget txt_en)))
+              (progn
+                (setq new_str (hsb:get-jewon-string en))
+                ;; 텍스트 내용 업데이트
+                (entmod (subst (cons 1 new_str) (assoc 1 (entget txt_en)) (entget txt_en)))
+                ;; 블록 및 텍스트의 OD 데이터 일괄 동기화 (SHP 내보내기 대비)
+                (ade_odsetfield en "HSB_DATA" "SPEC" 0 new_str)
+                (hsb:sync_od en txt_en)
+              )
+            )
+          )
+        )
+        (setq i (1+ i))
+      )
+      (princ (strcat "\n[성공] " (itoa i) "개의 물받이 동기화 완료."))
+    )
+  )
+  (princ)
+)
+
+;; 명령어: HSBC (Check)
+(defun c:HSBC (/ ss i en ent xdata txt_h txt_en od_str txt_str err_count)
+  (setq ss (ssget "X" '((0 . "INSERT") (-3 ("HSB_LINK")))))
+  (if ss (progn (if (not (tblsearch "LAYER" "_HSB_불일치")) (command "layer" "m" "_HSB_불일치" "c" "2" "" "")) (setq i 0 err_count 0) (repeat (sslength ss) (setq en (ssname ss i)) (setq ent (entget en '("HSB_LINK"))) (setq xdata (assoc -3 ent)) (setq txt_h (cdr (assoc 1005 (cdadr xdata)))) (setq txt_en (handent txt_h)) (if (and txt_en (setq txt_ent (entget txt_en))) (progn (setq od_str (hsb:get-jewon-string en)) (setq txt_str (cdr (assoc 1 txt_ent))) (if (/= od_str txt_str) (progn (entmake (list (cons 0 "CIRCLE") (cons 8 "_HSB_불일치") (cons 62 2) (cons 10 (cdr (assoc 10 (entget en)))) (cons 40 4.0))) (setq err_count (1+ err_count)) (princ (strcat "\n[불일치] " (vl-princ-to-string (ade_odgetfield en "HSB_DATA" "ORG_ID" 0)))))))) (setq i (1+ i))) (if (> err_count 0) (princ (strcat "\n[주의] 총 " (itoa err_count) "개의 불일치 발견.")) (princ "\n[검사 완료] 모든 데이터 일치."))))
+  (princ)
+)
+
+;; 명령어: HSBM (Missing)
+(defun c:HSBM (/ ss i en miss_count qty)
+  (princ "\n[누락 검사] 대상 물받이 블록들을 선택하세요: ")
+  (setq ss (ssget '((0 . "INSERT"))))
+  (if ss (progn (if (not (tblsearch "LAYER" "_HSB_미입력")) (command "layer" "m" "_HSB_미입력" "c" "2" "" "")) (setq i 0 miss_count 0) (repeat (sslength ss) (setq en (ssname ss i)) (setq qty (if (member (strcase "HSB_DATA") (mapcar 'strcase (ade_odtablelist))) (ade_odrecordqty en "HSB_DATA") 0)) (if (= qty 0) (progn (entmake (list (cons 0 "CIRCLE") (cons 8 "_HSB_미입력") (cons 62 2) (cons 10 (cdr (assoc 10 (entget en)))) (cons 40 4.0))) (setq miss_count (1+ miss_count)))) (setq i (1+ i))) (princ (strcat "\n[완료] 총 " (itoa miss_count) "개의 누락 객체 발견."))))
+  (princ)
+)
+
+(princ "\nHSB_KR 로드됨. 명령어: HSB, HSBU, HSBC, HSBM")
+(princ)
