@@ -276,7 +276,7 @@ r2 = R2Manager(R2_ENDPOINT, R2_ACCESS_KEY, R2_SECRET_KEY, R2_BUCKET_NAME)
 title_lbl = widgets.HTML("<h2>🏗️ AsinTech CAD Management (Colab Edition)</h2>")
 
 # 프로젝트 섹션
-project_dropdown = widgets.Dropdown(description="프로젝트:", style={'description_width': 'initial'}, layout=widgets.Layout(width='50%'))
+project_dropdown = widgets.Dropdown(description="프로젝트:", style={'description_width': 'initial'}, layout=widgets.Layout(width='95%'))
 refresh_btn = widgets.Button(description="새로고침", icon="refresh")
 create_proj_btn = widgets.Button(description="프로젝트 생성", icon="plus")
 delete_proj_btn = widgets.Button(description="프로젝트 삭제", icon="trash", button_style='danger')
@@ -297,13 +297,13 @@ drive_path_input = widgets.Text(
     placeholder='Google Drive 폴더 경로',
     description='Drive 경로:',
     disabled=True,
-    layout=widgets.Layout(width='70%')
+    layout=widgets.Layout(width='95%')
 )
 local_file_upload = widgets.FileUpload(
     accept='.dxf',
     multiple=True,
     description='로컬 DXF 선택',
-    layout=widgets.Layout(width='70%')
+    layout=widgets.Layout(width='95%')
 )
 upload_btn = widgets.Button(description="파일 업로드 실행", button_style='primary', icon="upload")
 upload_output = widgets.Output()
@@ -327,10 +327,10 @@ target_layers_select = widgets.SelectMultiple(
     options=['(파일 업로드 필요)'],
     disabled=True,
     style={'description_width': 'initial'},
-    layout=widgets.Layout(width='70%', height='150px')
+    layout=widgets.Layout(width='95%', height='200px')
 )
-select_all_btn = widgets.Button(description="전체 선택", icon="check-square", disabled=True, layout=widgets.Layout(width='120px'))
-deselect_all_btn = widgets.Button(description="전체 해제", icon="square", disabled=True, layout=widgets.Layout(width='120px'))
+select_all_btn = widgets.Button(description="전체 선택", icon="check-square", disabled=True, layout=widgets.Layout(width='47%'))
+deselect_all_btn = widgets.Button(description="전체 해제", icon="square", disabled=True, layout=widgets.Layout(width='47%'))
 
 cache_options = [("캐시 안함", "no-cache"), ("1년 (권장)", "public, max-age=31536000")]
 cache_radio = widgets.RadioButtons(options=cache_options, value="public, max-age=31536000", description='캐시 정책:', disabled=True)
@@ -868,7 +868,12 @@ select_all_btn.on_click(on_select_all)
 deselect_all_btn.on_click(on_deselect_all)
 
 # --- 레이아웃 구성 ---
-header = widgets.HBox([project_dropdown, refresh_btn, create_proj_btn, delete_proj_btn])
+header = widgets.VBox([
+    project_dropdown,
+    widgets.HBox([refresh_btn, create_proj_btn], layout=widgets.Layout(width='95%', justify_content='space-between')),
+    delete_proj_btn
+], layout=widgets.Layout(width='100%', padding='5px'))
+
 upload_ctrl = widgets.VBox([
     upload_type_radio,
     drive_path_input,
@@ -879,12 +884,12 @@ upload_ctrl = widgets.VBox([
 conversion_ctrl = widgets.VBox([
     crs_radio,
     target_layers_select,
-    widgets.HBox([select_all_btn, deselect_all_btn]),
+    widgets.HBox([select_all_btn, deselect_all_btn], layout=widgets.Layout(width='95%', justify_content='space-between')),
     layer_dropdown,
     reverse_check,
     cache_radio,
     convert_btn
-])
+], layout=widgets.Layout(width='100%'))
 
 main_ui = widgets.VBox([
     title_lbl,
