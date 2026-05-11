@@ -723,18 +723,35 @@ def run_conversion(b):
                     "color": e.dxf.get('color', 256)
                 }
 
-                if e.dxf.hasattr('rotation'):
-                    props['rotation'] = -float(e.dxf.rotation)
-                if dxftype == 'TEXT':
-                    props['align_h'] = e.dxf.halign
-                    props['align_v'] = e.dxf.valign
+                # [추가] 원본 TM 좌표 추출 (convert_r2.py와 동기화)
+                tm_pt = None
+                if dxftype in ['TEXT', 'MTEXT', 'INSERT']:
+                    tm_pt = e.dxf.insert
+                elif dxftype == 'POINT':
+                    tm_pt = e.dxf.location
+                elif dxftype == 'CIRCLE':
+                    tm_pt = e.dxf.center
+                elif dxftype == 'LINE':
+                    tm_pt = e.dxf.start
 
-                # [동기화] 회전 및 정렬 정보 추가
+                if tm_pt:
+                    props['tm_x'] = tm_pt[0]
+                    props['tm_y'] = tm_pt[1]
+                    
+                    # [동기화] 체인리지 계산 로직 통합
+                    if centerline_geom:
+                        try:
+                            pt_obj = Point(tm_pt[0], tm_pt[1])
+                            c_info = get_chainage_details(centerline_geom, pt_obj, centerline_len, is_reverse)
+                            if c_info: props['chainage'] = c_info
+                        except: pass
+
+                # 회전 및 정렬 정보 추출
                 if e.dxf.hasattr('rotation'):
                     props['rotation'] = -float(e.dxf.rotation)
-                if dxftype == 'TEXT':
-                    props['align_h'] = e.dxf.halign
-                    props['align_v'] = e.dxf.valign
+                if dxftype in ['TEXT', 'MTEXT']:
+                    props['align_h'] = e.dxf.get('halign', 0)
+                    props['align_v'] = e.dxf.get('valign', 0)
 
                 # 텍스트 내용
                 if dxftype in ['TEXT', 'MTEXT']:
@@ -761,14 +778,6 @@ def run_conversion(b):
                     p = e.dxf.insert if dxftype in ['TEXT', 'MTEXT'] else (e.dxf.center if dxftype == 'CIRCLE' else e.dxf.location)
                     pts = [p]
                     geom_type = "Point"
-
-                # 체인리지 계산 (Point 타입이고 중심선이 있을 때)
-                if geom_type == "Point" and centerline_geom and len(pts) > 0:
-                    try:
-                        pt_obj = Point(pts[0][0], pts[0][1])
-                        c_info = get_chainage_details(centerline_geom, pt_obj, centerline_len, is_reverse)
-                        if c_info: props['chainage'] = c_info
-                    except: pass
 
                 # 투영 변환
                 for p in pts:
