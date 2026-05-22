@@ -76,7 +76,10 @@ function handleApiRequest(e) {
       case 'triggerGitHubAction': response = triggerGitHubAction(e.parameter.projectId); break;
 
       // [메모 관리]
-      case 'uploadToDrive': response = uploadToDrive(e.parameter.fileName, e.parameter.fileData, e.parameter.mimeType); break;
+      case 'uploadToDrive': response = uploadToDrive(e.parameter.fileName, e.parameter.fileData, e.parameter.mimeType, e.parameter.projectId); break;
+      case 'getBackupFiles': response = getBackupFiles(e.parameter.projectId); break;
+      case 'deleteBackupFile': response = deleteBackupFile(e.parameter.fileId); break;
+      case 'clearBackupFolder': response = clearBackupFolder(e.parameter.projectId); break;
 
       default: response = { success: false, error: 'Unknown action' };
     }
@@ -611,12 +614,40 @@ function triggerGitHubAction(projectId) {
 // [메모 관리] 구글 드라이브/시트 연동 함수
 // ==========================================
 
-function uploadToDrive(fileName, fileData, mimeType) {
+function uploadToDrive(fileName, fileData, mimeType, projectId) {
+  const lock = LockService.getScriptLock();
+  // 최대 30초 동안 다른 프로세스의 접근을 대기시킵니다. (중복 폴더 생성 방지)
+  if (!lock.tryLock(30000)) return { success: false, error: '서버 대기 시간 초과' };
   try {
-    const folder = DriveApp.getFolderById(CONFIG.MEMO_PHOTO_FOLDER_ID);
+    let folder = DriveApp.getFolderById(CONFIG.MEMO_PHOTO_FOLDER_ID);
+
+    // [추가] 프로젝트 ID별 하위 폴더 자동 생성 및 분류 로직
+    if (projectId) {
+      const subFolders = folder.getFoldersByName(projectId);
+      if (subFolders.hasNext()) {
+        folder = subFolders.next();
+      } else {
+        // 폴더가 없으면 새로 생성하고 외부 접근 권한(링크가 있는 모든 사용자) 부여
+        folder = folder.createFolder(projectId);
+        try { folder.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW); } catch(e) {}
+      }
+    }
+
     const decoded = Utilities.base64Decode(fileData);
     const blob = Utilities.newBlob(decoded, mimeType, fileName);
-    const file = folder.createFile(blob);
+
+    // [개선] 동일한 이름의 파일이 이미 있는지 확인 (중복 생성 방지)
+    const existingFiles = folder.getFilesByName(fileName);
+    let file;
+    if (existingFiles.hasNext()) {
+      // [수정] 이미 존재하면 내용을 덮어쓰지 않고(부패 방지) 기존 파일 정보를 유지
+      file = existingFiles.next();
+      Logger.log("기존 파일이 이미 존재하여 업로드를 건너뜁니다: " + fileName);
+    } else {
+      // 없다면 새로 생성
+      file = folder.createFile(blob);
+      Logger.log("새 파일 생성 완료: " + fileName);
+    }
     
     // [수정] 공유 권한 설정 시 발생할 수 있는 '액세스 거부' 에러 격리
     // 조직의 보안 정책에 따라 public 공유가 막혀 있어도 파일 자체는 생성되었으므로 URL을 반환하도록 함
@@ -633,6 +664,63 @@ function uploadToDrive(fileName, fileData, mimeType) {
     
     return { success: true, url: url, fileId: fileId };
   } catch (e) { return { success: false, error: '드라이브 업로드 실패: ' + e.toString() }; }
+  finally {
+    lock.releaseLock();
+  }
+}
+
+/** [추가] 백업된 파일 목록 조회 */
+function getBackupFiles(projectId) {
+  try {
+    const parentFolder = DriveApp.getFolderById(CONFIG.MEMO_PHOTO_FOLDER_ID);
+    const subFolders = parentFolder.getFoldersByName(projectId);
+    if (!subFolders.hasNext()) return { success: true, files: [] };
+    
+    const folder = subFolders.next();
+    const files = folder.getFiles();
+    const result = [];
+    while (files.hasNext()) {
+      const f = files.next();
+      result.push({
+        id: f.getId(),
+        name: f.getName(),
+        size: f.getSize(),
+        date: f.getDateCreated().getTime(),
+        url: f.getUrl(), // 드라이브 뷰어 URL
+        downloadUrl: f.getDownloadUrl() // 직접 다운로드 URL
+      });
+    }
+    // 최신순 정렬
+    result.sort((a, b) => b.date - a.date);
+    return { success: true, files: result };
+  } catch (e) { return { success: false, error: e.toString() }; }
+}
+
+/** [추가] 백업 파일 개별 삭제 */
+function deleteBackupFile(fileId) {
+  try {
+    DriveApp.getFileById(fileId).setTrashed(true);
+    return { success: true };
+  } catch (e) { return { success: false, error: e.toString() }; }
+}
+
+/** [추가] 프로젝트 백업 폴더 전체 삭제 (비우기) */
+function clearBackupFolder(projectId) {
+  try {
+    const parentFolder = DriveApp.getFolderById(CONFIG.MEMO_PHOTO_FOLDER_ID);
+    const subFolders = parentFolder.getFoldersByName(projectId);
+    if (subFolders.hasNext()) {
+      const folder = subFolders.next();
+      const files = folder.getFiles();
+      let count = 0;
+      while (files.hasNext()) {
+        files.next().setTrashed(true);
+        count++;
+      }
+      return { success: true, count: count };
+    }
+    return { success: true, count: 0 };
+  } catch (e) { return { success: false, error: e.toString() }; }
 }
 
 // [수정] 오래된 메모 아카이빙 (동기화 및 정리)
