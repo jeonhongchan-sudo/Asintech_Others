@@ -213,6 +213,7 @@
       )
       (close fn)
       (setvar "osmode" old-os)
+      (if (> count 0) (command "_.zoom" "_e"))
       (princ (strcat "\n[완료] 총 " (itoa count) "개의 텍스트를 삽입하였습니다."))
     )
     (princ "\n[취소] 파일을 열 수 없거나 선택되지 않았습니다.")
