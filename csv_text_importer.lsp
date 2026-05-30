@@ -88,18 +88,48 @@
   (if (= out-mode "Dtext") (princ "\n[안내] Dtext 선택 시 줄바꿈 문자는 공백 없이 '//'로 대체됩니다."))
 
    ;; 0.1 스타일 선택 (도면 내 스타일 목록 추출)
-  (setq style-names "")
+  (setq style-list '())
   (setq st (tblnext "STYLE" t))
   (while st
-    (setq style-names (strcat style-names (cdr (assoc 2 st)) ", "))
+    (setq style-list (cons (cdr (assoc 2 st)) style-list))
     (setq st (tblnext "STYLE"))
   )
-  (princ (strcat "\n[정의된 스타일] " (substr style-names 1 (- (strlen style-names) 2))))
-  (setq sel-style (getstring t (strcat "\n사용할 스타일 이름을 입력하세요 <" (getvar "TEXTSTYLE") ">: ")))
-  (if (= sel-style "") (setq sel-style (getvar "TEXTSTYLE")))
-  (if (null (tblsearch "STYLE" sel-style))
-    (setq sel-style (getvar "TEXTSTYLE"))
+  (setq style-list (reverse style-list))
+
+  ;; 우선순위 스타일 필터링 (ghs, ngsw, standard)
+  (setq priority-list '())
+  (foreach p '("ghs" "ngsw" "standard")
+    (if (tblsearch "STYLE" p)
+      (setq priority-list (append priority-list (list p)))
+    )
   )
+
+  ;; 우선순위 스타일이 있으면 해당 리스트만 사용, 없으면 전체 리스트 사용
+  (if (> (length priority-list) 0)
+    (setq target-list priority-list)
+    (setq target-list style-list)
+  )
+
+  ;; 번호와 함께 스타일 리스트 출력
+  (princ "\n--- 사용할 스타일 번호를 선택하세요 ---")
+  (setq i 1)
+  (foreach s target-list
+    (princ (strcat "\n [" (itoa i) "] " s))
+    (setq i (1+ i))
+  )
+
+  (setq choice (getstring (strcat "\n선택할 스타일 번호 입력 <1 (" (car target-list) ")>: ")))
+  (if (or (= choice "") (not (distof choice)))
+    (setq sel-style (car target-list))
+    (progn
+      (setq idx (1- (fix (distof choice))))
+      (if (and (>= idx 0) (< idx (length target-list)))
+        (setq sel-style (nth idx target-list))
+        (setq sel-style (car target-list))
+      )
+    )
+  )
+  (princ (strcat "\n[확인] '" sel-style "' 스타일이 적용됩니다."))
 
   ;; 0.2 높이 선택
   (setq sel-height (getdist (strcat "\n텍스트 높이를 입력하세요 <0.3>: ")))
